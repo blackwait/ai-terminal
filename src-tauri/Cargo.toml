@@ -1,6 +1,6 @@
 [package]
 name = "ai-terminal"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI Terminal - Tauri 多会话终端"
 authors = ["you"]
 edition = "2021"

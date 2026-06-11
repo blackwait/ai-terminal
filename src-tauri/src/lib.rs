@@ -37,6 +37,43 @@ struct AppState {
 
 const RECENT_LIMIT: usize = 10;
 
+#[cfg(windows)]
+fn shell_command() -> (String, Vec<&'static str>) {
+    let shell = std::env::var("COMSPEC")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "cmd.exe".to_string());
+    (shell, Vec::new())
+}
+
+#[cfg(not(windows))]
+fn shell_command() -> (String, Vec<&'static str>) {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    (shell, vec!["-l"])
+}
+
+#[cfg(windows)]
+fn user_home_dir() -> Option<String> {
+    std::env::var("USERPROFILE")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| {
+            let drive = std::env::var("HOMEDRIVE").ok()?;
+            let path = std::env::var("HOMEPATH").ok()?;
+            let home = format!("{drive}{path}");
+            (!home.trim().is_empty()).then_some(home)
+        })
+        .or_else(|| std::env::var("HOME").ok().filter(|d| !d.trim().is_empty()))
+}
+
+#[cfg(not(windows))]
+fn user_home_dir() -> Option<String> {
+    std::env::var("HOME").ok().filter(|d| !d.trim().is_empty())
+}
+
 /// 配置文件路径：<app_config_dir>/dir-config.json
 fn config_file(app: &AppHandle) -> Option<PathBuf> {
     app.path()
@@ -135,20 +172,23 @@ fn create_session(
         })
         .map_err(|e| e.to_string())?;
 
-    // 使用用户默认 shell，保留完整的交互式终端能力
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    // 使用当前平台可启动的默认 shell，保留完整的交互式终端能力
+    let (shell, shell_args) = shell_command();
     let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-l");
+    for arg in shell_args {
+        cmd.arg(arg);
+    }
 
     // 工作目录：优先使用前端传入的 cwd，其次用户主目录
-    let work_dir = cwd
-        .filter(|d| !d.trim().is_empty())
-        .or_else(|| std::env::var("HOME").ok());
+    let work_dir = cwd.filter(|d| !d.trim().is_empty()).or_else(user_home_dir);
     if let Some(dir) = work_dir {
         cmd.cwd(dir);
     }
     cmd.env("TERM", "xterm-256color");
-    cmd.env("LANG", std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()));
+    cmd.env(
+        "LANG",
+        std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
+    );
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     // slave 端在子进程接管后即可释放
