@@ -358,7 +358,7 @@ body {
 .term-pane {
   position: absolute;
   inset: 0;
-  padding: 6px 8px;
+  padding: 6px 12px 6px 10px;
   display: none;
   background: var(--bg);
 }
@@ -367,6 +367,26 @@ body {
 }
 .term-pane .xterm {
   height: 100%;
+}
+
+/* 让滚动条占据固定宽度（macOS overlay 滚动条不占位会导致文字贴着滑块），
+   并通过透明边框在文字与滑块之间留出间隔 */
+.term-pane .xterm-viewport::-webkit-scrollbar {
+  width: 12px;
+}
+.term-pane .xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+.term-pane .xterm-viewport::-webkit-scrollbar-thumb {
+  background: #4a4a4a;
+  border-radius: 6px;
+  border: 3px solid var(--bg);
+  background-clip: padding-box;
+}
+.term-pane .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: #5e5e5e;
+  border: 3px solid var(--bg);
+  background-clip: padding-box;
 }
 
 /* ===== 空状态 ===== */
