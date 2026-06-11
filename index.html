@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Terminal</title>
+  </head>
+  <body>
+    <div id="app">
+      <!-- 左侧：工作目录侧栏 -->
+      <aside id="sidebar">
+        <div class="sb-title">工作目录</div>
+
+        <div class="sb-block">
+          <div class="sb-label">当前目录</div>
+          <div id="current-dir" class="sb-path" title="">用户主目录 (~)</div>
+        </div>
+
+        <div class="sb-actions">
+          <button id="pick-dir" class="sb-btn">选择文件夹…</button>
+          <button id="set-default" class="sb-btn ghost">设为默认</button>
+        </div>
+
+        <div class="sb-block">
+          <div class="sb-label">默认目录</div>
+          <div id="default-dir" class="sb-path muted" title="">未设置（使用主目录）</div>
+        </div>
+
+        <div class="sb-block sb-grow">
+          <div class="sb-label">最近使用</div>
+          <div id="recent-list" class="sb-recent"></div>
+        </div>
+
+        <div class="sb-hint">新建会话将基于「当前目录」打开</div>
+      </aside>
+
+      <!-- 右侧：主区域 -->
+      <div id="main">
+        <!-- 顶部标签栏 + 新建按钮 -->
+        <div id="tabbar">
+          <div id="tabs"></div>
+          <div id="actions">
+            <button class="new-btn kiro" data-kind="kiro" title="新建 Kiro 会话">
+              <span class="dot"></span>+ Kiro
+            </button>
+            <button class="new-btn codex" data-kind="codex" title="新建 Codex 会话">
+              <span class="dot"></span>+ Codex
+            </button>
+          </div>
+        </div>
+        <!-- 终端容器区 -->
+        <div id="terminals"></div>
+        <!-- 空状态提示 -->
+        <div id="empty-hint">
+          <div class="empty-inner">
+            <h1>AI Terminal</h1>
+            <p>点击右上角 <b>+ Kiro</b> 或 <b>+ Codex</b> 新建一个终端会话</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
