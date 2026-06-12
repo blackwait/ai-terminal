@@ -184,6 +184,55 @@ const TERM_THEME = {
   brightWhite: "#ffffff",
 };
 
+function syncImeTextarea(session) {
+  const { term } = session;
+  const textarea = term.textarea;
+  const screen = term.element?.querySelector(".xterm-screen");
+  if (!textarea || !screen || term.cols <= 0 || term.rows <= 0) return;
+
+  const rect = screen.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return;
+
+  const buffer = term.buffer.active;
+  const cellWidth = rect.width / term.cols;
+  const cellHeight = rect.height / term.rows;
+  const cursorX = Math.min(Math.max(buffer.cursorX, 0), term.cols - 1);
+  const cursorY = Math.min(Math.max(buffer.cursorY, 0), term.rows - 1);
+
+  textarea.style.left = `${cursorX * cellWidth}px`;
+  textarea.style.top = `${cursorY * cellHeight}px`;
+  textarea.style.width = `${Math.max(cellWidth, 1)}px`;
+  textarea.style.height = `${Math.max(cellHeight, 1)}px`;
+  textarea.style.lineHeight = `${Math.max(cellHeight, 1)}px`;
+}
+
+function attachImeTextareaSync(session) {
+  const sync = () => syncImeTextarea(session);
+  const textarea = session.term.textarea;
+  const disposers = [
+    session.term.onCursorMove(sync),
+    session.term.onRender(sync),
+    session.term.onResize(sync),
+  ];
+
+  if (textarea) {
+    const syncSoon = () => requestAnimationFrame(sync);
+    textarea.addEventListener("focus", sync);
+    textarea.addEventListener("keydown", syncSoon, true);
+    textarea.addEventListener("compositionstart", sync, true);
+    disposers.push({
+      dispose() {
+        textarea.removeEventListener("focus", sync);
+        textarea.removeEventListener("keydown", syncSoon, true);
+        textarea.removeEventListener("compositionstart", sync, true);
+      },
+    });
+  }
+
+  session.imeDisposers = disposers;
+  sync();
+}
+
 function uid() {
   return "s_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
@@ -243,6 +292,7 @@ async function newSession(kind) {
   };
   sessions.set(id, session);
   setTitle(session, defaultName);
+  attachImeTextareaSync(session);
 
   // ----- 输入：写回 PTY + 维护标签名 -----
   term.onData((data) => {
@@ -371,6 +421,7 @@ async function closeSession(id) {
   }
   s.unlistenOutput?.();
   s.unlistenExit?.();
+  s.imeDisposers?.forEach((d) => d.dispose?.());
   s.term.dispose();
   s.pane.remove();
   s.tab.remove();
@@ -389,6 +440,7 @@ async function closeSession(id) {
 function fit(session) {
   try {
     session.fitAddon.fit();
+    syncImeTextarea(session);
     const { cols, rows } = session.term;
     invoke("resize_session", { id: session.id, cols, rows }).catch(() => {});
   } catch (_) {
