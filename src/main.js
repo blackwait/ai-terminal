@@ -157,9 +157,9 @@ setDefaultBtn.addEventListener("click", applyAsDefault);
 /** 会话集合 id -> session */
 const sessions = new Map();
 let activeId = null;
-const kindCounters = { kiro: 0, codex: 0 };
+const kindCounters = { kiro: 0, codex: 0, claude: 0 };
 
-const KIND_LABEL = { kiro: "Kiro", codex: "Codex" };
+const KIND_LABEL = { kiro: "Kiro", codex: "Codex", claude: "Claude Code" };
 
 const TERM_THEME = {
   background: "#1e1e1e",

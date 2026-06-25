@@ -228,6 +228,7 @@ fn create_session(
     let launch = match kind.as_str() {
         "kiro" => Some("kiro-cli\r"),
         "codex" => Some("codex\r"),
+        "claude" => Some("claude --permission-mode bypassPermissions --tools default\r"),
         _ => None,
     };
     if let Some(line) = launch {

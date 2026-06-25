@@ -8,6 +8,7 @@
   --fg-dim: #8a8a8a;
   --kiro: #b48ead;
   --codex: #61afef;
+  --claude: #d97757;
   --accent: #0e639c;
 }
 
@@ -264,6 +265,9 @@ body {
 .tab.active.kind-codex::after {
   background: var(--codex);
 }
+.tab.active.kind-claude::after {
+  background: var(--claude);
+}
 
 .tab .tab-dot {
   width: 8px;
@@ -276,6 +280,9 @@ body {
 }
 .tab.kind-codex .tab-dot {
   background: var(--codex);
+}
+.tab.kind-claude .tab-dot {
+  background: var(--claude);
 }
 
 .tab .tab-title {
@@ -341,11 +348,17 @@ body {
 .new-btn.codex .dot {
   background: var(--codex);
 }
+.new-btn.claude .dot {
+  background: var(--claude);
+}
 .new-btn.kiro:hover {
   border-color: var(--kiro);
 }
 .new-btn.codex:hover {
   border-color: var(--codex);
+}
+.new-btn.claude:hover {
+  border-color: var(--claude);
 }
 
 /* ===== 终端区 ===== */
