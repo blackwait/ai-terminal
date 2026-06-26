@@ -153,13 +153,72 @@ async function initDirConfig() {
 pickDirBtn.addEventListener("click", pickDirectory);
 setDefaultBtn.addEventListener("click", applyAsDefault);
 
+// ===== AI 工具配置 =====
+const aiToolTabs = document.querySelectorAll(".ai-tool-tab");
+const aiBaseUrl = document.getElementById("ai-base-url");
+const aiApiKey = document.getElementById("ai-api-key");
+const aiModel = document.getElementById("ai-model");
+const aiApplyBtn = document.getElementById("ai-apply-btn");
+const aiConfigStatus = document.getElementById("ai-config-status");
+let currentAiTool = "codex";
+
+async function loadAiConfig(tool) {
+  try {
+    const cfg = await invoke("read_ai_config", { tool });
+    aiBaseUrl.value = cfg.baseUrl || "";
+    aiApiKey.value = cfg.apiKey || "";
+    aiModel.value = cfg.model || "";
+    aiConfigStatus.textContent = "";
+    aiConfigStatus.className = "ai-config-status";
+  } catch (err) {
+    aiBaseUrl.value = "";
+    aiApiKey.value = "";
+    aiModel.value = "";
+    aiConfigStatus.textContent = `读取失败: ${err}`;
+    aiConfigStatus.className = "ai-config-status error";
+  }
+}
+
+aiToolTabs.forEach((tab) => {
+  tab.addEventListener("click", () => {
+    aiToolTabs.forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+    currentAiTool = tab.dataset.tool;
+    loadAiConfig(currentAiTool);
+  });
+});
+
+aiApplyBtn.addEventListener("click", async () => {
+  try {
+    await invoke("write_ai_config", {
+      tool: currentAiTool,
+      config: {
+        baseUrl: aiBaseUrl.value.trim(),
+        apiKey: aiApiKey.value.trim(),
+        model: aiModel.value.trim(),
+      },
+    });
+    aiConfigStatus.textContent = "已保存";
+    aiConfigStatus.className = "ai-config-status success";
+    setTimeout(() => {
+      aiConfigStatus.textContent = "";
+      aiConfigStatus.className = "ai-config-status";
+    }, 2000);
+  } catch (err) {
+    aiConfigStatus.textContent = `保存失败: ${err}`;
+    aiConfigStatus.className = "ai-config-status error";
+  }
+});
+
+loadAiConfig(currentAiTool);
+
 
 /** 会话集合 id -> session */
 const sessions = new Map();
 let activeId = null;
-const kindCounters = { kiro: 0, codex: 0, claude: 0 };
+const kindCounters = { kiro: 0, codex: 0, claude: 0, mimo: 0 };
 
-const KIND_LABEL = { kiro: "Kiro", codex: "Codex", claude: "Claude Code" };
+const KIND_LABEL = { kiro: "Kiro", codex: "Codex", claude: "Claude Code", mimo: "MiMo" };
 
 const TERM_THEME = {
   background: "#1e1e1e",

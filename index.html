@@ -32,6 +32,38 @@
         </div>
 
         <div class="sb-hint">新建会话将基于「当前目录」打开</div>
+
+        <!-- AI 工具配置面板 -->
+        <div id="ai-config-panel">
+          <div class="sb-title">AI 配置</div>
+          <div class="ai-tool-tabs">
+            <label class="ai-tool-tab active" data-tool="codex">
+              <input type="radio" name="ai-tool" value="codex" checked> Codex
+            </label>
+            <label class="ai-tool-tab" data-tool="claude">
+              <input type="radio" name="ai-tool" value="claude"> Claude
+            </label>
+            <label class="ai-tool-tab" data-tool="mimo">
+              <input type="radio" name="ai-tool" value="mimo"> MiMo
+            </label>
+          </div>
+          <div class="ai-fields">
+            <div class="ai-field">
+              <label>Base URL</label>
+              <input type="text" id="ai-base-url" placeholder="https://api.example.com/v1">
+            </div>
+            <div class="ai-field">
+              <label>API Key</label>
+              <input type="text" id="ai-api-key" placeholder="sk-...">
+            </div>
+            <div class="ai-field">
+              <label>Model</label>
+              <input type="text" id="ai-model" placeholder="gpt-5.5">
+            </div>
+          </div>
+          <button id="ai-apply-btn" class="ai-apply-btn">应用</button>
+          <div id="ai-config-status" class="ai-config-status"></div>
+        </div>
       </aside>
 
       <!-- 右侧：主区域 -->
@@ -49,6 +81,9 @@
             <button class="new-btn claude" data-kind="claude" title="新建 Claude Code 会话">
               <span class="dot"></span>+ Claude Code
             </button>
+            <button class="new-btn mimo" data-kind="mimo" title="新建 MiMo 会话">
+              <span class="dot"></span>+ MiMo
+            </button>
           </div>
         </div>
         <!-- 终端容器区 -->
@@ -57,7 +92,7 @@
         <div id="empty-hint">
           <div class="empty-inner">
             <h1>AI Terminal</h1>
-            <p>点击右上角 <b>+ Kiro</b>、<b>+ Codex</b> 或 <b>+ Claude Code</b> 新建一个终端会话</p>
+            <p>点击右上角 <b>+ Kiro</b>、<b>+ Codex</b>、<b>+ Claude Code</b> 或 <b>+ MiMo</b> 新建一个终端会话</p>
           </div>
         </div>
       </div>

@@ -9,6 +9,7 @@
   --kiro: #b48ead;
   --codex: #61afef;
   --claude: #d97757;
+  --mimo: #98c379;
   --accent: #0e639c;
 }
 
@@ -203,6 +204,114 @@ body {
   padding-top: 8px;
 }
 
+/* ===== AI 配置面板 ===== */
+#ai-config-panel {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ai-tool-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.ai-tool-tab {
+  flex: 1 1 auto;
+  text-align: center;
+  font-size: 11px;
+  padding: 4px 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--fg-dim);
+  background: transparent;
+  transition: all 0.15s;
+}
+
+.ai-tool-tab input[type="radio"] {
+  display: none;
+}
+
+.ai-tool-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.ai-tool-tab:hover:not(.active) {
+  background: #2d2d2d;
+}
+
+.ai-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ai-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ai-field label {
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+.ai-field input {
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #2d2d2d;
+  color: var(--fg);
+  font-size: 11px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.ai-field input:focus {
+  border-color: var(--accent);
+}
+
+.ai-field input::placeholder {
+  color: #555;
+}
+
+.ai-apply-btn {
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.ai-apply-btn:hover {
+  background: #1177bb;
+}
+
+.ai-config-status {
+  font-size: 10px;
+  text-align: center;
+  min-height: 14px;
+  color: var(--fg-dim);
+}
+
+.ai-config-status.success {
+  color: #0dbc79;
+}
+
+.ai-config-status.error {
+  color: #cd3131;
+}
+
 /* ===== 顶部标签栏 ===== */
 #tabbar {
   display: flex;
@@ -268,6 +377,9 @@ body {
 .tab.active.kind-claude::after {
   background: var(--claude);
 }
+.tab.active.kind-mimo::after {
+  background: var(--mimo);
+}
 
 .tab .tab-dot {
   width: 8px;
@@ -283,6 +395,9 @@ body {
 }
 .tab.kind-claude .tab-dot {
   background: var(--claude);
+}
+.tab.kind-mimo .tab-dot {
+  background: var(--mimo);
 }
 
 .tab .tab-title {
@@ -351,6 +466,9 @@ body {
 .new-btn.claude .dot {
   background: var(--claude);
 }
+.new-btn.mimo .dot {
+  background: var(--mimo);
+}
 .new-btn.kiro:hover {
   border-color: var(--kiro);
 }
@@ -359,6 +477,9 @@ body {
 }
 .new-btn.claude:hover {
   border-color: var(--claude);
+}
+.new-btn.mimo:hover {
+  border-color: var(--mimo);
 }
 
 /* ===== 终端区 ===== */

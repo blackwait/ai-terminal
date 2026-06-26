@@ -229,6 +229,7 @@ fn create_session(
         "kiro" => Some("kiro-cli\r"),
         "codex" => Some("codex\r"),
         "claude" => Some("claude --permission-mode bypassPermissions --tools default\r"),
+        "mimo" => Some("mimo --trust --never-ask\r"),
         _ => None,
     };
     if let Some(line) = launch {
@@ -279,6 +280,207 @@ fn close_session(state: State<AppState>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// AI 工具配置项
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiToolConfig {
+    /// 基础 URL
+    base_url: String,
+    /// API 密钥
+    api_key: String,
+    /// 模型名称
+    model: String,
+}
+
+/// 读取指定 AI 工具的配置
+#[tauri::command]
+fn read_ai_config(tool: String) -> Result<AiToolConfig, String> {
+    let home = user_home_dir().ok_or("无法获取用户主目录")?;
+    match tool.as_str() {
+        "codex" => {
+            // ~/.codex/config.toml + ~/.codex/auth.json
+            let config_path = format!("{}/.codex/config.toml", home);
+            let auth_path = format!("{}/.codex/auth.json", home);
+            let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+            let auth_text = std::fs::read_to_string(&auth_path).unwrap_or_default();
+            // 解析 TOML 中的 model 和 base_url
+            let mut model = String::new();
+            let mut base_url = String::new();
+            for line in config_text.lines() {
+                let trimmed = line.trim();
+                if let Some(v) = trimmed.strip_prefix("model = ") {
+                    model = v.trim_matches('"').to_string();
+                }
+                if let Some(v) = trimmed.strip_prefix("base_url = ") {
+                    base_url = v.trim_matches('"').to_string();
+                }
+            }
+            // 解析 auth.json 中的 OPENAI_API_KEY
+            let mut api_key = String::new();
+            if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&auth_text) {
+                if let Some(key) = auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()) {
+                    api_key = key.to_string();
+                }
+            }
+            Ok(AiToolConfig { base_url, api_key, model })
+        }
+        "claude" => {
+            // ~/.claude/settings.json
+            let settings_path = format!("{}/.claude/settings.json", home);
+            let text = std::fs::read_to_string(&settings_path).unwrap_or_default();
+            let mut base_url = String::new();
+            let mut api_key = String::new();
+            let mut model = String::new();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(env) = v.get("env") {
+                    base_url = env.get("ANTHROPIC_BASE_URL").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    api_key = env.get("ANTHROPIC_API_KEY").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    model = env.get("ANTHROPIC_MODEL").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                }
+            }
+            Ok(AiToolConfig { base_url, api_key, model })
+        }
+        "mimo" => {
+            // ~/.local/share/mimocode/auth.json
+            let auth_path = format!("{}/.local/share/mimocode/auth.json", home);
+            let text = std::fs::read_to_string(&auth_path).unwrap_or_default();
+            let mut base_url = String::new();
+            let mut api_key = String::new();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(creds) = v.get("credentials").and_then(|c| c.as_array()) {
+                    if let Some(first) = creds.first() {
+                        base_url = first.get("baseUrl").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                        api_key = first.get("apiKey").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    }
+                }
+            }
+            // MiMo 模型从 config.toml 的 model 字段读取（如果存在）
+            let mimo_config_path = format!("{}/.mimocode/config.toml", home);
+            let mut model = String::new();
+            if let Ok(cfg_text) = std::fs::read_to_string(&mimo_config_path) {
+                for line in cfg_text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(v) = trimmed.strip_prefix("model = ") {
+                        model = v.trim_matches('"').to_string();
+                    }
+                }
+            }
+            Ok(AiToolConfig { base_url, api_key, model })
+        }
+        _ => Err(format!("未知工具类型: {}", tool)),
+    }
+}
+
+/// 写入指定 AI 工具的配置
+#[tauri::command]
+fn write_ai_config(tool: String, config: AiToolConfig) -> Result<(), String> {
+    let home = user_home_dir().ok_or("无法获取用户主目录")?;
+    match tool.as_str() {
+        "codex" => {
+            // 更新 ~/.codex/config.toml 中的 model 和 base_url
+            let config_path = format!("{}/.codex/config.toml", home);
+            let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
+            content = update_toml_value(&content, "model", &config.model);
+            // 更新 model_providers.custom.base_url
+            content = update_toml_section_value(&content, "model_providers.custom", "base_url", &config.base_url);
+            std::fs::write(&config_path, content).map_err(|e| e.to_string())?;
+            // 更新 ~/.codex/auth.json
+            let auth_path = format!("{}/.codex/auth.json", home);
+            let auth = serde_json::json!({ "OPENAI_API_KEY": config.api_key });
+            std::fs::write(&auth_path, serde_json::to_string_pretty(&auth).unwrap()).map_err(|e| e.to_string())?;
+        }
+        "claude" => {
+            // 更新 ~/.claude/settings.json 中的 env 字段
+            let settings_path = format!("{}/.claude/settings.json", home);
+            let text = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
+            let mut v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
+            let env = v.get_mut("env").cloned().unwrap_or(serde_json::json!({}));
+            let mut env_map = env.as_object().cloned().unwrap_or_default();
+            env_map.insert("ANTHROPIC_BASE_URL".into(), serde_json::Value::String(config.base_url));
+            env_map.insert("ANTHROPIC_API_KEY".into(), serde_json::Value::String(config.api_key));
+            env_map.insert("ANTHROPIC_MODEL".into(), serde_json::Value::String(config.model.clone()));
+            env_map.insert("ANTHROPIC_SMALL_FAST_MODEL".into(), serde_json::Value::String(config.model));
+            v["env"] = serde_json::Value::Object(env_map);
+            std::fs::write(&settings_path, serde_json::to_string_pretty(&v).unwrap()).map_err(|e| e.to_string())?;
+        }
+        "mimo" => {
+            // 更新 ~/.local/share/mimocode/auth.json
+            let auth_path = format!("{}/.local/share/mimocode/auth.json", home);
+            let auth = serde_json::json!({
+                "version": 1,
+                "credentials": [{
+                    "provider": "custom",
+                    "apiKey": config.api_key,
+                    "baseUrl": config.base_url
+                }]
+            });
+            std::fs::write(&auth_path, serde_json::to_string_pretty(&auth).unwrap()).map_err(|e| e.to_string())?;
+            // 更新 ~/.mimocode/config.toml 中的 model
+            if !config.model.is_empty() {
+                let mimo_config_path = format!("{}/.mimocode/config.toml", home);
+                let mut content = std::fs::read_to_string(&mimo_config_path).unwrap_or_default();
+                if content.contains("model = ") {
+                    content = update_toml_value(&content, "model", &config.model);
+                } else {
+                    content = format!("model = \"{}\"\n{}", config.model, content);
+                }
+                if let Some(parent) = std::path::Path::new(&mimo_config_path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&mimo_config_path, content).map_err(|e| e.to_string())?;
+            }
+        }
+        _ => return Err(format!("未知工具类型: {}", tool)),
+    }
+    Ok(())
+}
+
+/// 更新 TOML 文件中的顶层 key = "value"
+fn update_toml_value(content: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    let mut found = false;
+    for line in &mut lines {
+        if line.trim().starts_with(&format!("{} = ", key)) {
+            *line = format!("{} = \"{}\"", key, value);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        lines.insert(0, format!("{} = \"{}\"", key, value));
+    }
+    lines.join("\n")
+}
+
+/// 更新 TOML 文件中 [section] 下的 key = "value"
+fn update_toml_section_value(content: &str, section: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    let section_header = format!("[{}]", section);
+    let mut in_section = false;
+    let mut found = false;
+    for line in &mut lines {
+        if line.trim() == section_header {
+            in_section = true;
+            continue;
+        }
+        if in_section && line.trim().starts_with('[') {
+            break;
+        }
+        if in_section && line.trim().starts_with(&format!("{} = ", key)) {
+            *line = format!("{} = \"{}\"", key, value);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        // 在 section header 后面插入
+        if let Some(pos) = lines.iter().position(|l| l.trim() == section_header) {
+            lines.insert(pos + 1, format!("{} = \"{}\"", key, value));
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -297,7 +499,9 @@ pub fn run() {
             close_session,
             get_dir_config,
             set_default_dir,
-            add_recent_dir
+            add_recent_dir,
+            read_ai_config,
+            write_ai_config
         ])
         .run(tauri::generate_context!())
         .expect("启动 AI Terminal 失败");
