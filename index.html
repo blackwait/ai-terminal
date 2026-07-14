@@ -111,7 +111,7 @@
           <button
             class="new-btn resume ghost"
             id="resume-picker-btn"
-            title="打开会话选择器（上次工具 · ⌘⌥T）"
+            title="从历史会话列表中选择续聊（⌘⌥T）"
           >
             ☰ 选会话
           </button>
@@ -346,6 +346,44 @@
       <div class="modal-panel palette-panel">
         <input id="palette-input" type="text" placeholder="输入命令…" autocomplete="off" />
         <div id="palette-list" class="palette-list"></div>
+      </div>
+    </div>
+
+    <!-- 续聊：历史会话选择 -->
+    <div id="resume-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="resume"></div>
+      <div class="modal-panel resume-panel">
+        <div class="modal-header">
+          <h2 id="resume-modal-title">选择历史会话</h2>
+          <button class="icon-btn" data-close="resume" title="关闭">×</button>
+        </div>
+        <div class="resume-toolbar">
+          <div class="resume-kind-tabs" id="resume-kind-tabs" role="tablist">
+            <button type="button" class="resume-kind-tab" data-kind="codex">Codex</button>
+            <button type="button" class="resume-kind-tab" data-kind="kiro">Kiro</button>
+            <button type="button" class="resume-kind-tab" data-kind="claude">Claude</button>
+            <button type="button" class="resume-kind-tab" data-kind="mimo">MiMo</button>
+          </div>
+          <label class="resume-cwd-filter">
+            <input type="checkbox" id="resume-filter-cwd" checked />
+            仅当前目录
+          </label>
+        </div>
+        <input
+          id="resume-search"
+          class="resume-search"
+          type="search"
+          placeholder="搜索标题 / 路径 / ID…"
+          autocomplete="off"
+        />
+        <div id="resume-list" class="resume-list" role="listbox"></div>
+        <div class="resume-footer">
+          <button type="button" id="resume-last-in-modal" class="sb-btn ghost">
+            直接续最近一次
+          </button>
+          <button type="button" id="resume-refresh-btn" class="sb-btn ghost">刷新列表</button>
+        </div>
+        <div id="resume-status" class="ai-config-status"></div>
       </div>
     </div>
 

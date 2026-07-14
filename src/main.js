@@ -1295,72 +1295,82 @@ function syncImeTextarea(session) {
 }
 
 /**
- * 中文输入法切到「英文/大写」态时，Shift+/ 问号等标点在 WebView + xterm 中常丢失：
- * - keyCode=229 被 CompositionHelper 吞掉，textarea 又无变化
- * - 或 key 为 Process / Unidentified，evaluateKeyboardEvent 得不到字符
- * 在捕获阶段 + attachCustomKeyEventHandler 双重兜底，直接写入 PTY。
+ * 中文输入法英文态下，仅少数标点（尤其 ?）会因 keyCode=229 丢失。
+ * 切勿对 a-z 等普通字符强制写入：会与 xterm 正常路径双发，表现为「字间空格/重字」。
+ * 策略：只拦截「需要兜底的标点」；普通字母完全交给 xterm。
  */
-function resolveImeFallbackCharacter(event) {
+const IME_PUNCTUATION_CODE_MAP = {
+  Slash: ["/", "?"],
+  Period: [".", ">"],
+  Comma: [",", "<"],
+  Semicolon: [";", ":"],
+  Quote: ["'", '"'],
+  BracketLeft: ["[", "{"],
+  BracketRight: ["]", "}"],
+  Backslash: ["\\", "|"],
+  Minus: ["-", "_"],
+  Equal: ["=", "+"],
+  Backquote: ["`", "~"],
+  Digit1: ["1", "!"],
+  Digit2: ["2", "@"],
+  Digit3: ["3", "#"],
+  Digit4: ["4", "$"],
+  Digit5: ["5", "%"],
+  Digit6: ["6", "^"],
+  Digit7: ["7", "&"],
+  Digit8: ["8", "*"],
+  Digit9: ["9", "("],
+  Digit0: ["0", ")"],
+};
+
+function isAsciiLetterOrDigitKey(event) {
+  const key = event?.key || "";
+  if (key.length === 1 && /[A-Za-z0-9]/.test(key)) return true;
+  const code = event?.code || "";
+  return /^Key[A-Z]$/.test(code) || /^Digit[0-9]$/.test(code);
+}
+
+function resolveImePunctuationCharacter(event) {
   if (!event) return null;
   if (event.metaKey || event.ctrlKey || event.altKey) return null;
-  // 正在拼中文候选时不要硬插标点
   if (event.isComposing) return null;
-  const key = event.key;
-  if (key && key.length === 1 && key !== "\u0000") return key;
-  // key 为 Process/Unidentified 时，用 code + shift 还原（尤其 Slash → ?）
-  const code = event.code || "";
   const shifted = !!event.shiftKey;
-  const codeMap = {
-    Slash: shifted ? "?" : "/",
-    Period: shifted ? ">" : ".",
-    Comma: shifted ? "<" : ",",
-    Semicolon: shifted ? ":" : ";",
-    Quote: shifted ? '"' : "'",
-    BracketLeft: shifted ? "{" : "[",
-    BracketRight: shifted ? "}" : "]",
-    Backslash: shifted ? "|" : "\\",
-    Minus: shifted ? "_" : "-",
-    Equal: shifted ? "+" : "=",
-    Backquote: shifted ? "~" : "`",
-    Digit1: shifted ? "!" : "1",
-    Digit2: shifted ? "@" : "2",
-    Digit3: shifted ? "#" : "3",
-    Digit4: shifted ? "$" : "4",
-    Digit5: shifted ? "%" : "5",
-    Digit6: shifted ? "^" : "6",
-    Digit7: shifted ? "&" : "7",
-    Digit8: shifted ? "*" : "8",
-    Digit9: shifted ? "(" : "9",
-    Digit0: shifted ? ")" : "0",
-  };
-  if (codeMap[code]) return codeMap[code];
-  // 无 code 时用 keyCode 191 兜底 Slash
-  if (event.keyCode === 191 || event.which === 191) {
-    return shifted ? "?" : "/";
+  const code = event.code || "";
+  const pair = IME_PUNCTUATION_CODE_MAP[code];
+  if (pair) return shifted ? pair[1] : pair[0];
+  const keyCode = event.keyCode || event.which || 0;
+  if (keyCode === 191) return shifted ? "?" : "/";
+  // 仅当 key 本身就是我们关心的标点时才采用（避免把字母当兜底）
+  const key = event.key;
+  if (key && key.length === 1 && !/[A-Za-z0-9\s]/.test(key)) {
+    // 常见易丢标点
+    if ("?/!@#$%^&*()_+-=[]{}\\|;:'\",.<>`~".includes(key)) return key;
   }
   return null;
 }
 
-function shouldForceImePrintable(event) {
+function shouldForceImePunctuation(event) {
   if (!event || event.type !== "keydown") return false;
   if (event.metaKey || event.ctrlKey || event.altKey) return false;
   if (event.isComposing) return false;
+  // 字母数字绝不强制，防止双发
+  if (isAsciiLetterOrDigitKey(event)) return false;
   const keyCode = event.keyCode || event.which || 0;
-  if (keyCode === 229) return true;
-  if (event.key === "Process" || event.key === "Unidentified") return true;
-  // 少数 WebView：Slash 无 key、无 229，但 code 是 Slash 且 shift
-  if (
-    (event.code === "Slash" || keyCode === 191) &&
-    (!event.key || event.key.length !== 1)
-  ) {
-    return true;
-  }
+  const imeLike =
+    keyCode === 229 ||
+    event.key === "Process" ||
+    event.key === "Unidentified";
+  const isSlash =
+    event.code === "Slash" || keyCode === 191 || event.which === 191;
+  const isMappedPunctuation = Boolean(IME_PUNCTUATION_CODE_MAP[event.code || ""]);
+  // 仅 IME 异常态 + 标点键，或 Slash 在 Unidentified 时
+  if (imeLike && (isMappedPunctuation || isSlash)) return true;
+  if (isSlash && (!event.key || event.key.length !== 1)) return true;
   return false;
 }
 
 function writeForcedSessionCharacter(session, character) {
   if (!session || session.exited || !character) return false;
-  // 同一按键可能同时命中 customKeyHandler 与 capture，短窗口去重
   const now = Date.now();
   if (
     session._lastForcedChar === character &&
@@ -1386,17 +1396,17 @@ function attachImePunctuationFix(session) {
   const textarea = term.textarea;
   if (!textarea) return;
 
-  const handleForcedPrintable = (event) => {
+  const handleForcedPunctuation = (event) => {
     if (session.exited) return false;
-    if (!shouldForceImePrintable(event)) return false;
-    const character = resolveImeFallbackCharacter(event);
+    if (!shouldForceImePunctuation(event)) return false;
+    const character = resolveImePunctuationCharacter(event);
     if (!character) return false;
     writeForcedSessionCharacter(session, character);
     return true;
   };
 
   const onKeyDownCapture = (event) => {
-    if (!handleForcedPrintable(event)) return;
+    if (!handleForcedPunctuation(event)) return;
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation?.();
@@ -1405,10 +1415,9 @@ function attachImePunctuationFix(session) {
   textarea.addEventListener("keydown", onKeyDownCapture, true);
   session.imePunctuationHandler = onKeyDownCapture;
 
-  // xterm 内部 keydown 也会走 custom handler；返回 false 阻止其默认处理
   try {
     term.attachCustomKeyEventHandler((event) => {
-      if (handleForcedPrintable(event)) return false;
+      if (handleForcedPunctuation(event)) return false;
       return true;
     });
   } catch (_) {
@@ -1590,18 +1599,180 @@ async function resumeLastSession(kind = lastKind || "codex", options = {}) {
   });
 }
 
-/** 续聊：打开该工具的会话选择器，挑选历史会话 */
+/** 续聊：打开应用内历史会话列表（可点选） */
 async function resumePickerSession(kind = lastKind || "codex", options = {}) {
   const targetKind = kind || "codex";
   if (!supportsResume(targetKind)) {
     await newSession(targetKind, options);
     return;
   }
-  await newSession(targetKind, {
-    ...options,
-    resumeMode: "picker",
-    title: options.title || undefined,
+  await openResumeSessionPicker(targetKind);
+}
+
+// ---------------------------------------------------------------------------
+// 续聊：历史会话列表
+// ---------------------------------------------------------------------------
+const resumeModal = document.getElementById("resume-modal");
+const resumeListEl = document.getElementById("resume-list");
+const resumeSearchEl = document.getElementById("resume-search");
+const resumeFilterCwdEl = document.getElementById("resume-filter-cwd");
+const resumeStatusEl = document.getElementById("resume-status");
+const resumeKindTabsEl = document.getElementById("resume-kind-tabs");
+const resumeModalTitleEl = document.getElementById("resume-modal-title");
+
+let resumePickerKind = "codex";
+/** @type {Array<{id:string,title:string,cwd?:string|null,updatedAt?:string|null,source?:string}>} */
+let resumeHistoryItems = [];
+let resumeHistoryLoading = false;
+
+function formatResumeUpdatedAt(value) {
+  if (value == null || value === "") return "";
+  const raw = String(value);
+  // 秒级时间戳
+  if (/^\d{10,13}$/.test(raw)) {
+    const numberValue = Number(raw);
+    const ms = raw.length >= 13 ? numberValue : numberValue * 1000;
+    const date = new Date(ms);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toLocaleString();
+    }
+  }
+  const parsed = Date.parse(raw);
+  if (!Number.isNaN(parsed)) {
+    return new Date(parsed).toLocaleString();
+  }
+  return raw;
+}
+
+function setResumeStatus(message, type = "") {
+  if (!resumeStatusEl) return;
+  resumeStatusEl.textContent = message || "";
+  resumeStatusEl.className = `ai-config-status${type ? ` ${type}` : ""}`;
+}
+
+function updateResumeKindTabs() {
+  if (!resumeKindTabsEl) return;
+  resumeKindTabsEl.querySelectorAll(".resume-kind-tab").forEach((button) => {
+    button.classList.toggle("active", button.dataset.kind === resumePickerKind);
   });
+  if (resumeModalTitleEl) {
+    resumeModalTitleEl.textContent = `选择历史会话 · ${KIND_LABEL[resumePickerKind] || resumePickerKind}`;
+  }
+}
+
+function filteredResumeHistoryItems() {
+  const query = (resumeSearchEl?.value || "").trim().toLowerCase();
+  if (!query) return resumeHistoryItems;
+  return resumeHistoryItems.filter((item) => {
+    const haystack = [item.title, item.cwd, item.id, item.source]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(query);
+  });
+}
+
+function renderResumeHistoryList() {
+  if (!resumeListEl) return;
+  const items = filteredResumeHistoryItems();
+  resumeListEl.innerHTML = "";
+  if (resumeHistoryLoading) {
+    resumeListEl.innerHTML = '<div class="resume-empty">正在加载历史会话…</div>';
+    return;
+  }
+  if (!items.length) {
+    resumeListEl.innerHTML =
+      '<div class="resume-empty">未找到历史会话。可取消「仅当前目录」或换工具后再试。</div>';
+    return;
+  }
+  for (const item of items) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "resume-item";
+    row.dataset.sessionId = item.id;
+    const title = document.createElement("div");
+    title.className = "resume-item-title";
+    title.textContent = item.title || item.id;
+    const meta = document.createElement("div");
+    meta.className = "resume-item-meta";
+    const parts = [];
+    if (item.cwd) parts.push(item.cwd);
+    const updated = formatResumeUpdatedAt(item.updatedAt);
+    if (updated) parts.push(updated);
+    parts.push(item.id);
+    meta.textContent = parts.join(" · ");
+    row.append(title, meta);
+    row.addEventListener("click", () => {
+      openHistorySession(resumePickerKind, item);
+    });
+    resumeListEl.appendChild(row);
+  }
+}
+
+async function loadResumeHistoryList() {
+  if (!resumeListEl) return;
+  resumeHistoryLoading = true;
+  renderResumeHistoryList();
+  setResumeStatus("加载中…");
+  const filterByCwd = resumeFilterCwdEl ? resumeFilterCwdEl.checked : true;
+  const cwdArg = filterByCwd ? currentDir || null : null;
+  try {
+    const items = await invoke("list_ai_sessions", {
+      kind: resumePickerKind,
+      cwd: cwdArg,
+      limit: 50,
+    });
+    resumeHistoryItems = Array.isArray(items) ? items : [];
+    resumeHistoryLoading = false;
+    renderResumeHistoryList();
+    setResumeStatus(
+      resumeHistoryItems.length
+        ? `共 ${resumeHistoryItems.length} 条（${KIND_LABEL[resumePickerKind] || resumePickerKind}）`
+        : "暂无历史会话",
+      resumeHistoryItems.length ? "success" : ""
+    );
+  } catch (err) {
+    resumeHistoryItems = [];
+    resumeHistoryLoading = false;
+    renderResumeHistoryList();
+    setResumeStatus(String(err), "error");
+  }
+}
+
+async function openHistorySession(kind, item) {
+  if (!item?.id) return;
+  closeResumeSessionPicker();
+  const launchCommand = buildResumeLaunchCommand(kind, "last", item.id);
+  if (!launchCommand) {
+    await newSession(kind);
+    return;
+  }
+  const shortTitle = (item.title || item.id).slice(0, 28);
+  await newSession(kind, {
+    cwd: item.cwd || currentDir || null,
+    title: `${KIND_LABEL[kind] || kind} · ${shortTitle}`,
+    resumeMode: "last",
+    launchCommand,
+  });
+}
+
+async function openResumeSessionPicker(kind = lastKind || "codex") {
+  if (!resumeModal) {
+    // 无 UI 时回退 CLI picker
+    await newSession(kind, { resumeMode: "picker" });
+    return;
+  }
+  resumePickerKind = supportsResume(kind) ? kind : "codex";
+  if (resumeSearchEl) resumeSearchEl.value = "";
+  updateResumeKindTabs();
+  resumeModal.hidden = false;
+  setResumeStatus("");
+  await loadResumeHistoryList();
+  resumeSearchEl?.focus();
+}
+
+function closeResumeSessionPicker() {
+  if (resumeModal) resumeModal.hidden = true;
 }
 
 async function closeSession(id, options = {}) {
@@ -2755,6 +2926,10 @@ window.addEventListener("keydown", (event) => {
       hideTabContextMenu();
       return;
     }
+    if (resumeModal && !resumeModal.hidden) {
+      closeResumeSessionPicker();
+      return;
+    }
     if (!settingsModal.hidden) {
       closeSettings();
       return;
@@ -3013,6 +3188,34 @@ document.getElementById("resume-last-btn")?.addEventListener("click", () => {
 });
 document.getElementById("resume-picker-btn")?.addEventListener("click", () => {
   resumePickerSession(lastKind || "codex");
+});
+
+// 续聊历史列表面板
+if (resumeKindTabsEl) {
+  resumeKindTabsEl.addEventListener("click", (event) => {
+    const button = event.target.closest(".resume-kind-tab");
+    if (!button?.dataset.kind) return;
+    resumePickerKind = button.dataset.kind;
+    updateResumeKindTabs();
+    loadResumeHistoryList();
+  });
+}
+resumeFilterCwdEl?.addEventListener("change", () => {
+  loadResumeHistoryList();
+});
+resumeSearchEl?.addEventListener("input", () => {
+  renderResumeHistoryList();
+});
+document.getElementById("resume-refresh-btn")?.addEventListener("click", () => {
+  loadResumeHistoryList();
+});
+document.getElementById("resume-last-in-modal")?.addEventListener("click", () => {
+  const kind = resumePickerKind;
+  closeResumeSessionPicker();
+  resumeLastSession(kind);
+});
+resumeModal?.querySelectorAll("[data-close='resume']").forEach((el) => {
+  el.addEventListener("click", closeResumeSessionPicker);
 });
 
 window.addEventListener("resize", () => {

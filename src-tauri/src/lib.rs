@@ -559,6 +559,490 @@ fn check_all_cli(state: State<AppState>) -> Vec<CliCheckResult> {
         .collect()
 }
 
+// ---------- AI 历史会话列表（应用内续聊选择）----------
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiHistorySession {
+    id: String,
+    title: String,
+    cwd: Option<String>,
+    updated_at: Option<String>,
+    source: String,
+}
+
+fn normalize_path_for_compare(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let canonical = Path::new(trimmed)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(trimmed));
+    canonical
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn path_matches_filter(session_cwd: Option<&str>, filter_cwd: Option<&str>) -> bool {
+    let Some(filter) = filter_cwd.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let Some(session_path) = session_cwd.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    normalize_path_for_compare(session_path) == normalize_path_for_compare(filter)
+}
+
+fn truncate_title(text: &str, max_chars: usize) -> String {
+    let cleaned = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.chars().count() <= max_chars {
+        return cleaned;
+    }
+    let mut out = String::new();
+    for (index, ch) in cleaned.chars().enumerate() {
+        if index >= max_chars.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn extract_codex_session_id_from_filename(path: &Path) -> Option<String> {
+    let name = path.file_stem()?.to_string_lossy();
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    let uuid_parts = &parts[parts.len().saturating_sub(5)..];
+    let candidate = uuid_parts.join("-");
+    if candidate.len() >= 32 {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn list_codex_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
+    let home = match user_home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let sessions_root = PathBuf::from(&home).join(".codex").join("sessions");
+    if !sessions_root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![sessions_root];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+                .unwrap_or(false)
+            {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort_by(|left, right| {
+        let left_time = std::fs::metadata(left)
+            .and_then(|m| m.modified())
+            .ok();
+        let right_time = std::fs::metadata(right)
+            .and_then(|m| m.modified())
+            .ok();
+        right_time.cmp(&left_time)
+    });
+
+    let mut results = Vec::new();
+    for path in files {
+        if results.len() >= limit {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut session_id = extract_codex_session_id_from_filename(&path);
+        let mut session_cwd: Option<String> = None;
+        let mut title: Option<String> = None;
+        let mut updated_at: Option<String> = None;
+
+        for line in text.lines().take(120) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let record_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if record_type == "session_meta" {
+                if let Some(payload) = value.get("payload") {
+                    if session_id.is_none() {
+                        session_id = payload
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    session_cwd = payload
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    updated_at = value
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            payload
+                                .get("timestamp")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        });
+                }
+            }
+            if title.is_none() {
+                for pointer in [
+                    "/payload/message",
+                    "/payload/text",
+                    "/payload/content",
+                    "/message",
+                    "/text",
+                ] {
+                    if let Some(text_value) = value.pointer(pointer).and_then(|v| v.as_str()) {
+                        let trimmed = text_value.trim();
+                        if !trimmed.is_empty() {
+                            title = Some(truncate_title(trimmed, 80));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(id) = session_id else {
+            continue;
+        };
+        if !path_matches_filter(session_cwd.as_deref(), filter_cwd) {
+            continue;
+        }
+        if updated_at.is_none() {
+            if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    updated_at = Some(duration.as_secs().to_string());
+                }
+            }
+        }
+        let display_title = title.unwrap_or_else(|| {
+            session_cwd
+                .as_deref()
+                .and_then(|cwd| Path::new(cwd).file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Codex 会话".into())
+        });
+        results.push(AiHistorySession {
+            id,
+            title: display_title,
+            cwd: session_cwd,
+            updated_at,
+            source: "codex".into(),
+        });
+    }
+    results
+}
+
+fn run_command_capture(program: &str, args: &[&str], cwd: Option<&str>) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(dir) = cwd {
+        if !dir.trim().is_empty() && Path::new(dir).is_dir() {
+            command.current_dir(dir);
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    let output = command.output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "命令失败: {} {}\n{}{}",
+            program,
+            args.join(" "),
+            stdout,
+            stderr
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn list_kiro_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
+    // 先按当前目录列；为空再放宽到无 cwd 过滤（CLI 可能只返回当前目录）
+    let cwd = filter_cwd.unwrap_or("");
+    let output = match run_command_capture(
+        "kiro-cli",
+        &["chat", "-l", "-f", "json"],
+        if cwd.is_empty() { None } else { Some(cwd) },
+    ) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output.trim()) else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    let Some(groups) = parsed.as_array() else {
+        return results;
+    };
+    for group in groups {
+        let group_cwd = group.get("cwd").and_then(|v| v.as_str());
+        if !path_matches_filter(group_cwd, filter_cwd) && group_cwd.is_some() {
+            continue;
+        }
+        let sessions = group
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_else(|| {
+                if group.get("sessionId").is_some() || group.get("id").is_some() {
+                    vec![group.clone()]
+                } else {
+                    Vec::new()
+                }
+            });
+        for session in sessions {
+            if results.len() >= limit {
+                break;
+            }
+            let id = session
+                .get("sessionId")
+                .or_else(|| session.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let title = session
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| truncate_title(s, 80))
+                .filter(|s| !s.is_empty() && s != "(no title)")
+                .unwrap_or_else(|| "Kiro 会话".into());
+            let updated_at = session
+                .get("updatedAt")
+                .or_else(|| session.get("updated_at"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            results.push(AiHistorySession {
+                id,
+                title,
+                cwd: group_cwd
+                    .map(|s| s.to_string())
+                    .or_else(|| filter_cwd.map(|s| s.to_string())),
+                updated_at,
+                source: "kiro".into(),
+            });
+        }
+    }
+    results.truncate(limit);
+    results
+}
+
+fn list_mimo_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
+    let n = limit.max(5).to_string();
+    let output = match run_command_capture(
+        "mimo",
+        &["session", "list", "-n", &n, "--format", "json"],
+        filter_cwd,
+    ) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output.trim()) else {
+        return Vec::new();
+    };
+    let Some(items) = parsed.as_array() else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for item in items {
+        if results.len() >= limit {
+            break;
+        }
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let session_cwd = item
+            .get("directory")
+            .or_else(|| item.get("cwd"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if !path_matches_filter(session_cwd.as_deref(), filter_cwd) {
+            continue;
+        }
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_title(s, 80))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "MiMo 会话".into());
+        let updated_at = item.get("updated").and_then(|v| match v {
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
+        results.push(AiHistorySession {
+            id,
+            title,
+            cwd: session_cwd,
+            updated_at,
+            source: "mimo".into(),
+        });
+    }
+    results
+}
+
+fn list_claude_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
+    let home = match user_home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let projects_root = PathBuf::from(&home).join(".claude").join("projects");
+    if !projects_root.is_dir() {
+        return Vec::new();
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&projects_root) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Ok(children) = std::fs::read_dir(&dir) {
+                for child in children.flatten() {
+                    let path = child.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+    }
+    files.sort_by(|left, right| {
+        let left_time = std::fs::metadata(left)
+            .and_then(|m| m.modified())
+            .ok();
+        let right_time = std::fs::metadata(right)
+            .and_then(|m| m.modified())
+            .ok();
+        right_time.cmp(&left_time)
+    });
+    let mut results = Vec::new();
+    for path in files {
+        if results.len() >= limit {
+            break;
+        }
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut session_cwd: Option<String> = None;
+        let mut title: Option<String> = None;
+        for line in text.lines().take(40) {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            if session_cwd.is_none() {
+                session_cwd = value
+                    .get("cwd")
+                    .or_else(|| value.pointer("/session/cwd"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+            if title.is_none() {
+                if let Some(text_value) = value
+                    .pointer("/message/content/0/text")
+                    .or_else(|| value.get("text"))
+                    .and_then(|v| v.as_str())
+                {
+                    let trimmed = text_value.trim();
+                    if !trimmed.is_empty() {
+                        title = Some(truncate_title(trimmed, 80));
+                    }
+                }
+            }
+        }
+        if filter_cwd.is_some()
+            && session_cwd.is_some()
+            && !path_matches_filter(session_cwd.as_deref(), filter_cwd)
+        {
+            continue;
+        }
+        let updated_at = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string());
+        results.push(AiHistorySession {
+            id,
+            title: title.unwrap_or_else(|| "Claude 会话".into()),
+            cwd: session_cwd.or_else(|| filter_cwd.map(|s| s.to_string())),
+            updated_at,
+            source: "claude".into(),
+        });
+    }
+    results
+}
+
+#[tauri::command]
+fn list_ai_sessions(
+    kind: String,
+    cwd: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<AiHistorySession>, String> {
+    let max_items = limit.unwrap_or(40).clamp(1, 100) as usize;
+    let filter = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let list = match kind.as_str() {
+        "codex" => list_codex_history_sessions(filter, max_items),
+        "kiro" => list_kiro_history_sessions(filter, max_items),
+        "mimo" => list_mimo_history_sessions(filter, max_items),
+        "claude" => list_claude_history_sessions(filter, max_items),
+        _ => return Err(format!("不支持列出历史会话的工具: {kind}")),
+    };
+    Ok(list)
+}
+
 // ---------- 会话 ----------
 
 #[tauri::command]
@@ -1273,6 +1757,7 @@ pub fn run() {
             resize_session,
             close_session,
             close_all_sessions,
+            list_ai_sessions,
             get_dir_config,
             get_app_config,
             update_prefs,

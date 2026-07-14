@@ -1767,6 +1767,122 @@ body::after {
   width: min(500px, 92vw);
   overflow: hidden;
 }
+
+/* ===== Resume session picker ===== */
+.resume-panel {
+  width: min(640px, 94vw);
+  max-height: min(80vh, 720px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.resume-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px 10px;
+  flex-wrap: wrap;
+}
+.resume-kind-tabs {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+}
+.resume-kind-tab {
+  border: 1px solid var(--color-border);
+  background: rgba(0, 0, 0, 0.45);
+  color: var(--color-muted);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--font-ui);
+}
+.resume-kind-tab.active {
+  color: var(--btn-primary-fg);
+  background: var(--btn-primary-gradient);
+  border-color: transparent;
+}
+.resume-cwd-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-muted);
+  user-select: none;
+  white-space: nowrap;
+}
+.resume-search {
+  margin: 0 16px 10px;
+  height: 36px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.45);
+  color: var(--fg);
+  padding: 0 12px;
+  font-size: 13px;
+  font-family: var(--font-ui);
+  outline: none;
+}
+.resume-search:focus {
+  border-color: var(--color-border-strong);
+}
+.resume-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 0 12px 8px;
+  min-height: 180px;
+  max-height: 420px;
+}
+.resume-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 6px;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  transition: background var(--duration), border-color var(--duration);
+}
+.resume-item:hover {
+  background: rgba(0, 255, 156, 0.1);
+  border-color: rgba(0, 255, 156, 0.28);
+}
+.resume-item-title {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.resume-item-meta {
+  font-size: 11px;
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+.resume-empty {
+  padding: 28px 12px;
+  text-align: center;
+  color: var(--color-muted);
+  font-size: 13px;
+}
+.resume-footer {
+  display: flex;
+  gap: 8px;
+  padding: 10px 16px 12px;
+  border-top: 1px solid var(--color-border);
+}
+.resume-panel .ai-config-status {
+  margin: 0 16px 12px;
+}
 #palette-input {
   width: 100%;
   height: 48px;
