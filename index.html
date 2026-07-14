@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="cyberpunk">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -9,11 +9,22 @@
     <div id="app">
       <!-- 左侧：工作目录侧栏 -->
       <aside id="sidebar">
-        <div class="sb-title">工作目录</div>
+        <div class="sb-brand">
+          <span class="sb-brand-mark" aria-hidden="true"></span>
+          <div class="sb-brand-text">
+            <div class="sb-brand-name">AI Terminal</div>
+            <div class="sb-brand-sub">// NEON_OPS_v0.2</div>
+          </div>
+          <button id="sidebar-collapse-btn" class="icon-btn" title="折叠侧栏 (⌘B)" aria-label="折叠侧栏">‹</button>
+        </div>
+
+        <div class="sb-header">
+          <div class="sb-title">工作目录</div>
+        </div>
 
         <div class="sb-block">
           <div class="sb-label">当前目录</div>
-          <div id="current-dir" class="sb-path" title="">用户主目录 (~)</div>
+          <div id="current-dir" class="sb-path muted" title="">用户主目录 (~)</div>
         </div>
 
         <div class="sb-actions">
@@ -26,77 +37,359 @@
           <div id="default-dir" class="sb-path muted" title="">未设置（使用主目录）</div>
         </div>
 
+        <div class="sb-block">
+          <div class="sb-label-row">
+            <span class="sb-label">筛选项目</span>
+            <kbd class="sb-kbd">⌘P</kbd>
+          </div>
+          <input
+            id="dir-filter"
+            class="sb-filter-input"
+            type="search"
+            placeholder="过滤钉住 / 最近…"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </div>
+
+        <div class="sb-block">
+          <div class="sb-label-row">
+            <span class="sb-label">钉住</span>
+          </div>
+          <div id="pinned-list" class="sb-recent"></div>
+        </div>
+
         <div class="sb-block sb-grow">
-          <div class="sb-label">最近使用</div>
+          <div class="sb-label-row">
+            <span class="sb-label">最近使用</span>
+            <button id="clear-recent" class="link-btn" title="清空最近">清空</button>
+          </div>
           <div id="recent-list" class="sb-recent"></div>
         </div>
 
-        <div class="sb-hint">新建会话将基于「当前目录」打开</div>
+        <div class="sb-hint">新建会话基于「当前目录」· ⌘P 搜项目 · ⌘K 命令 · 标签右键可批量关闭</div>
 
-        <!-- AI 工具配置面板 -->
-        <div id="ai-config-panel">
-          <div class="sb-title">AI 配置</div>
-          <div class="ai-tool-tabs">
-            <label class="ai-tool-tab active" data-tool="codex">
-              <input type="radio" name="ai-tool" value="codex" checked> Codex
-            </label>
-            <label class="ai-tool-tab" data-tool="claude">
-              <input type="radio" name="ai-tool" value="claude"> Claude
-            </label>
-            <label class="ai-tool-tab" data-tool="mimo">
-              <input type="radio" name="ai-tool" value="mimo"> MiMo
-            </label>
-          </div>
-          <div class="ai-fields">
-            <div class="ai-field">
-              <label>Base URL</label>
-              <input type="text" id="ai-base-url" placeholder="https://api.example.com/v1">
-            </div>
-            <div class="ai-field">
-              <label>API Key</label>
-              <input type="text" id="ai-api-key" placeholder="sk-...">
-            </div>
-            <div class="ai-field">
-              <label>Model</label>
-              <input type="text" id="ai-model" placeholder="gpt-5.5">
-            </div>
-          </div>
-          <button id="ai-apply-btn" class="ai-apply-btn">应用</button>
-          <div id="ai-config-status" class="ai-config-status"></div>
+        <div class="sb-footer">
+          <button id="open-settings-btn" class="sb-btn ghost">设置…</button>
         </div>
       </aside>
 
+      <button id="sidebar-expand-btn" class="sidebar-expand" title="展开侧栏 (⌘B)" hidden>›</button>
+
       <!-- 右侧：主区域 -->
       <div id="main">
-        <!-- 顶部标签栏 + 新建按钮 -->
+        <!-- 第一行：会话标签 -->
         <div id="tabbar">
           <div id="tabs"></div>
-          <div id="actions">
-            <button class="new-btn kiro" data-kind="kiro" title="新建 Kiro 会话">
-              <span class="dot"></span>+ Kiro
-            </button>
-            <button class="new-btn codex" data-kind="codex" title="新建 Codex 会话">
-              <span class="dot"></span>+ Codex
-            </button>
-            <button class="new-btn claude" data-kind="claude" title="新建 Claude Code 会话">
-              <span class="dot"></span>+ Claude Code
-            </button>
-            <button class="new-btn mimo" data-kind="mimo" title="新建 MiMo 会话">
-              <span class="dot"></span>+ MiMo
-            </button>
-          </div>
         </div>
-        <!-- 终端容器区 -->
+        <!-- 第二行：新建会话 / 命令面板 -->
+        <div id="actions">
+          <span class="actions-label">新建</span>
+          <button class="new-btn kiro" data-kind="kiro" title="新建 Kiro (⌘⇧K)">
+            <span class="dot"></span>+ Kiro
+          </button>
+          <button class="new-btn codex" data-kind="codex" title="新建 Codex (⌘T)">
+            <span class="dot"></span>+ Codex
+          </button>
+          <button class="new-btn claude" data-kind="claude" title="新建 Claude Code">
+            <span class="dot"></span>+ Claude
+          </button>
+          <button class="new-btn mimo" data-kind="mimo" title="新建 MiMo">
+            <span class="dot"></span>+ MiMo
+          </button>
+          <button class="new-btn shell" data-kind="shell" title="新建纯 Shell">
+            <span class="dot"></span>+ Shell
+          </button>
+          <span class="actions-sep" aria-hidden="true"></span>
+          <button
+            class="new-btn resume"
+            id="resume-last-btn"
+            title="续聊最近会话（上次工具 · ⌘⇧T）"
+          >
+            ↩ 续聊
+          </button>
+          <button
+            class="new-btn resume ghost"
+            id="resume-picker-btn"
+            title="打开会话选择器（上次工具 · ⌘⌥T）"
+          >
+            ☰ 选会话
+          </button>
+          <span class="actions-spacer"></span>
+          <button class="icon-btn" id="cmd-palette-btn" title="命令面板 (⌘K)">⌘K</button>
+        </div>
+
+        <!-- 搜索条 -->
+        <div id="search-bar" hidden>
+          <input id="search-input" type="text" placeholder="在终端中搜索…" autocomplete="off" />
+          <button id="search-prev" class="icon-btn" title="上一个">↑</button>
+          <button id="search-next" class="icon-btn" title="下一个">↓</button>
+          <button id="search-close" class="icon-btn" title="关闭 (Esc)">×</button>
+        </div>
+
         <div id="terminals"></div>
-        <!-- 空状态提示 -->
+
         <div id="empty-hint">
           <div class="empty-inner">
+            <div class="empty-badge">NEON // LINK ESTABLISHED</div>
             <h1>AI Terminal</h1>
-            <p>点击右上角 <b>+ Kiro</b>、<b>+ Codex</b>、<b>+ Claude Code</b> 或 <b>+ MiMo</b> 新建一个终端会话</p>
+            <p>接入多 AI CLI 节点 · 并行会话 · 本地最高权限通道</p>
+            <div class="empty-actions">
+              <button class="empty-card kiro" data-kind="kiro"><span class="dot"></span>Kiro</button>
+              <button class="empty-card codex" data-kind="codex"><span class="dot"></span>Codex</button>
+              <button class="empty-card claude" data-kind="claude"><span class="dot"></span>Claude</button>
+              <button class="empty-card mimo" data-kind="mimo"><span class="dot"></span>MiMo</button>
+              <button class="empty-card shell" data-kind="shell"><span class="dot"></span>Shell</button>
+            </div>
+            <p class="empty-keys">⌘T 新建 · ⌘⇧T 续聊 · ⌘P 搜项目 · ⌘⇧R 重启 · ⌘K 命令 · ⌘\ 分屏</p>
+          </div>
+        </div>
+
+        <div id="statusbar">
+          <span id="status-cwd" class="status-item">~</span>
+          <span id="status-branch" class="status-item muted" title="Git 分支">—</span>
+          <span id="status-kind" class="status-item muted">—</span>
+          <span id="status-state" class="status-item muted">就绪</span>
+          <span class="status-spacer"></span>
+          <span id="status-size" class="status-item muted">—</span>
+          <span id="status-font" class="status-item muted">13px</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 设置弹层 -->
+    <div id="settings-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="settings"></div>
+      <div class="modal-panel settings-panel">
+        <div class="modal-header">
+          <h2>设置</h2>
+          <button class="icon-btn" data-close="settings" title="关闭">×</button>
+        </div>
+        <div class="settings-tabs">
+          <button class="settings-tab active" data-pane="ai">AI 配置</button>
+          <button class="settings-tab" data-pane="launch">启动参数</button>
+          <button class="settings-tab" data-pane="profiles">配置档案</button>
+          <button class="settings-tab" data-pane="theme">主题</button>
+          <button class="settings-tab" data-pane="general">通用</button>
+        </div>
+        <div class="settings-body">
+          <!-- AI 配置 -->
+          <div class="settings-pane active" data-pane="ai">
+            <div class="ai-tool-tabs" id="settings-ai-tabs">
+              <label class="ai-tool-tab active" data-tool="codex">
+                <input type="radio" name="ai-tool" value="codex" checked /> Codex
+              </label>
+              <label class="ai-tool-tab" data-tool="claude">
+                <input type="radio" name="ai-tool" value="claude" /> Claude
+              </label>
+              <label class="ai-tool-tab" data-tool="mimo">
+                <input type="radio" name="ai-tool" value="mimo" /> MiMo
+              </label>
+            </div>
+            <div class="ai-fields">
+              <div class="ai-field">
+                <label>Base URL</label>
+                <input type="text" id="ai-base-url" placeholder="https://api.example.com/v1" />
+              </div>
+              <div class="ai-field">
+                <label>API Key</label>
+                <div class="input-with-action">
+                  <input type="password" id="ai-api-key" placeholder="sk-..." autocomplete="off" />
+                  <button type="button" id="toggle-api-key" class="icon-btn" title="显示/隐藏">👁</button>
+                </div>
+              </div>
+              <div class="ai-field">
+                <label>Model</label>
+                <input type="text" id="ai-model" placeholder="模型名" />
+              </div>
+            </div>
+            <div class="settings-actions">
+              <button id="ai-test-btn" class="sb-btn ghost">测试连通</button>
+              <button id="ai-apply-btn" class="sb-btn">保存到工具配置</button>
+            </div>
+            <div id="ai-config-status" class="ai-config-status"></div>
+            <p class="settings-note">保存后写入对应 CLI 配置文件；已开会话需新建后生效。</p>
+          </div>
+
+          <!-- 启动参数 -->
+          <div class="settings-pane" data-pane="launch">
+            <div class="ai-field">
+              <label><input type="checkbox" id="pref-auto-launch" checked /> 自动启动 AI CLI</label>
+            </div>
+            <div class="ai-field">
+              <label>注入延迟 (ms)</label>
+              <input type="number" id="pref-launch-delay" min="0" max="5000" step="50" value="400" />
+            </div>
+            <div class="ai-field">
+              <label>Kiro 命令</label>
+              <input type="text" id="launch-kiro" />
+            </div>
+            <div class="ai-field">
+              <label>Codex 命令</label>
+              <input type="text" id="launch-codex" />
+            </div>
+            <div class="ai-field">
+              <label>Claude 命令</label>
+              <input type="text" id="launch-claude" />
+            </div>
+            <div class="ai-field">
+              <label>MiMo 命令</label>
+              <input type="text" id="launch-mimo" />
+            </div>
+            <div class="settings-actions">
+              <button id="save-launch-btn" class="sb-btn">保存启动参数</button>
+            </div>
+            <div id="launch-status" class="ai-config-status"></div>
+            <p class="settings-note">
+              默认启用最高权限模式：Claude 使用
+              <code>bypassPermissions</code>，MiMo 使用
+              <code>--trust --never-ask</code>。可按需改成更保守的命令。
+            </p>
+          </div>
+
+          <!-- 档案 -->
+          <div class="settings-pane" data-pane="profiles">
+            <div class="ai-fields">
+              <div class="ai-field">
+                <label>档案名称</label>
+                <input type="text" id="profile-name" placeholder="公司中转 / 个人" />
+              </div>
+              <div class="ai-field">
+                <label>工具</label>
+                <select id="profile-tool">
+                  <option value="codex">Codex</option>
+                  <option value="claude">Claude</option>
+                  <option value="mimo">MiMo</option>
+                </select>
+              </div>
+              <div class="ai-field">
+                <label>Base URL</label>
+                <input type="text" id="profile-base-url" />
+              </div>
+              <div class="ai-field">
+                <label>API Key</label>
+                <input type="password" id="profile-api-key" autocomplete="off" />
+              </div>
+              <div class="ai-field">
+                <label>Model</label>
+                <input type="text" id="profile-model" />
+              </div>
+            </div>
+            <div class="settings-actions">
+              <button id="profile-save-btn" class="sb-btn">保存档案</button>
+              <button id="profile-from-current-btn" class="sb-btn ghost">从当前 AI 表单填充</button>
+            </div>
+            <div id="profiles-list" class="profiles-list"></div>
+          </div>
+
+          <!-- 主题 -->
+          <div class="settings-pane" data-pane="theme">
+            <p class="settings-note" style="margin-top: 0">
+              选择科技风外壳主题，点击即可预览并自动保存。终端配色会同步切换。
+            </p>
+            <div id="theme-grid" class="theme-grid" role="listbox" aria-label="界面主题"></div>
+            <div id="theme-status" class="ai-config-status"></div>
+          </div>
+
+          <!-- 通用 -->
+          <div class="settings-pane" data-pane="general">
+            <div class="ai-field">
+              <label>终端字号</label>
+              <input type="number" id="pref-font-size" min="10" max="28" value="13" />
+            </div>
+            <div class="ai-field">
+              <label
+                ><input type="checkbox" id="pref-restore" /> 启动时恢复上次会话列表（AI
+                工具会用 CLI resume 续聊）</label
+              >
+            </div>
+            <p class="settings-note">
+              续聊依赖各 CLI 自己的会话存储（Codex/Kiro/Claude/MiMo），不是回放终端屏幕缓冲。
+              工具栏「↩ 续聊」= 最近会话，「☰ 选会话」= 打开 CLI 选择器。
+            </p>
+            <div class="ai-field">
+              <label><input type="checkbox" id="pref-copy-on-select" checked /> 选择即复制（选中终端文本后自动复制）</label>
+            </div>
+            <div class="ai-field">
+              <label
+                ><input type="checkbox" id="pref-notify-exit" checked />
+                后台会话退出时系统通知</label
+              >
+            </div>
+            <div class="ai-field">
+              <label
+                ><input type="checkbox" id="pref-notify-task-done" checked />
+                任务静默完成后系统通知（约 4.5s 无输出）</label
+              >
+            </div>
+            <p class="settings-note">
+              标签圆点：蓝灰=空闲 · 黄=执行中 · 绿=本轮完成 · 灰=已退出。完成判定为输出静默，不是解析 AI
+              文案。
+            </p>
+            <div class="cli-status-block">
+              <div class="sb-label">CLI 就绪状态</div>
+              <div id="cli-status-list" class="cli-status-list"></div>
+              <button id="refresh-cli-btn" class="sb-btn ghost">重新检测</button>
+            </div>
+            <div class="settings-actions">
+              <button id="save-general-btn" class="sb-btn">保存通用设置</button>
+            </div>
+            <div id="general-status" class="ai-config-status"></div>
           </div>
         </div>
       </div>
     </div>
+
+    <!-- 命令面板 -->
+    <div id="command-palette" class="modal" hidden>
+      <div class="modal-backdrop" data-close="palette"></div>
+      <div class="modal-panel palette-panel">
+        <input id="palette-input" type="text" placeholder="输入命令…" autocomplete="off" />
+        <div id="palette-list" class="palette-list"></div>
+      </div>
+    </div>
+
+    <!-- 确认对话框 -->
+    <div id="confirm-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close="confirm"></div>
+      <div class="modal-panel confirm-panel">
+        <p id="confirm-message">确认？</p>
+        <div class="settings-actions">
+          <button id="confirm-cancel" class="sb-btn ghost">取消</button>
+          <button id="confirm-ok" class="sb-btn">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 终端右键菜单 -->
+    <div id="term-context-menu" class="ctx-menu" hidden>
+      <button type="button" data-action="copy">复制</button>
+      <button type="button" data-action="paste">粘贴</button>
+      <div class="ctx-sep"></div>
+      <button type="button" data-action="select-all">全选</button>
+      <button type="button" data-action="clear">清屏</button>
+      <div class="ctx-sep"></div>
+      <button type="button" data-action="search">搜索…</button>
+      <button type="button" data-action="export">导出日志</button>
+      <div class="ctx-sep"></div>
+      <button type="button" data-action="restart">重启会话</button>
+      <button type="button" data-action="duplicate">复制会话</button>
+      <div class="ctx-sep"></div>
+      <button type="button" data-action="toggle-copy-on-select" id="ctx-copy-on-select">
+        选择即复制：开
+      </button>
+    </div>
+
+    <!-- 标签右键菜单 -->
+    <div id="tab-context-menu" class="ctx-menu" hidden role="menu" aria-label="标签操作">
+      <button type="button" data-tab-action="close" role="menuitem">关闭</button>
+      <button type="button" data-tab-action="close-others" role="menuitem">关闭其他标签</button>
+      <button type="button" data-tab-action="close-left" role="menuitem">关闭左侧标签</button>
+      <button type="button" data-tab-action="close-right" role="menuitem">关闭右侧标签</button>
+      <div class="ctx-sep" role="separator"></div>
+      <button type="button" data-tab-action="close-all" role="menuitem">关闭全部标签</button>
+    </div>
+
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
