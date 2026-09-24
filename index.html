@@ -97,6 +97,9 @@
           <button class="new-btn mimo" data-kind="mimo" title="新建 MiMo">
             <span class="dot"></span>+ MiMo
           </button>
+          <button class="new-btn grok" data-kind="grok" title="新建 Grok（最高权限）">
+            <span class="dot"></span>+ Grok
+          </button>
           <button class="new-btn shell" data-kind="shell" title="新建纯 Shell">
             <span class="dot"></span>+ Shell
           </button>
@@ -139,6 +142,7 @@
               <button class="empty-card codex" data-kind="codex"><span class="dot"></span>Codex</button>
               <button class="empty-card claude" data-kind="claude"><span class="dot"></span>Claude</button>
               <button class="empty-card mimo" data-kind="mimo"><span class="dot"></span>MiMo</button>
+              <button class="empty-card grok" data-kind="grok"><span class="dot"></span>Grok</button>
               <button class="empty-card shell" data-kind="shell"><span class="dot"></span>Shell</button>
             </div>
             <p class="empty-keys">⌘T 新建 · ⌘⇧T 续聊 · ⌘P 搜项目 · ⌘⇧R 重启 · ⌘K 命令 · ⌘\ 分屏</p>
@@ -184,6 +188,9 @@
               </label>
               <label class="ai-tool-tab" data-tool="mimo">
                 <input type="radio" name="ai-tool" value="mimo" /> MiMo
+              </label>
+              <label class="ai-tool-tab" data-tool="grok">
+                <input type="radio" name="ai-tool" value="grok" /> Grok
               </label>
             </div>
             <div class="ai-fields">
@@ -236,6 +243,10 @@
               <label>MiMo 命令</label>
               <input type="text" id="launch-mimo" />
             </div>
+            <div class="ai-field">
+              <label>Grok 命令</label>
+              <input type="text" id="launch-grok" />
+            </div>
             <div class="settings-actions">
               <button id="save-launch-btn" class="sb-btn">保存启动参数</button>
             </div>
@@ -243,7 +254,8 @@
             <p class="settings-note">
               默认启用最高权限模式：Claude 使用
               <code>bypassPermissions</code>，MiMo 使用
-              <code>--trust --never-ask</code>。可按需改成更保守的命令。
+              <code>--trust --never-ask</code>，Grok 使用
+              <code>--always-approve --permission-mode bypassPermissions</code>。可按需改成更保守的命令。
             </p>
           </div>
 
@@ -260,6 +272,7 @@
                   <option value="codex">Codex</option>
                   <option value="claude">Claude</option>
                   <option value="mimo">MiMo</option>
+                  <option value="grok">Grok</option>
                 </select>
               </div>
               <div class="ai-field">
@@ -304,7 +317,7 @@
               >
             </div>
             <p class="settings-note">
-              续聊依赖各 CLI 自己的会话存储（Codex/Kiro/Claude/MiMo），不是回放终端屏幕缓冲。
+              续聊依赖各 CLI 自己的会话存储（Codex/Kiro/Claude/MiMo/Grok），不是回放终端屏幕缓冲。
               工具栏「↩ 续聊」= 最近会话，「☰ 选会话」= 打开 CLI 选择器。
             </p>
             <div class="ai-field">
@@ -363,6 +376,7 @@
             <button type="button" class="resume-kind-tab" data-kind="kiro">Kiro</button>
             <button type="button" class="resume-kind-tab" data-kind="claude">Claude</button>
             <button type="button" class="resume-kind-tab" data-kind="mimo">MiMo</button>
+            <button type="button" class="resume-kind-tab" data-kind="grok">Grok</button>
           </div>
           <label class="resume-cwd-filter">
             <input type="checkbox" id="resume-filter-cwd" checked />

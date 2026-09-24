@@ -1,6 +1,6 @@
 # AI Terminal
 
-面向本机 AI CLI 的多项目工作台：在选定工作目录下，一键打开 **Kiro / Codex / Claude / MiMo / Shell** 多标签终端，并统一管理 API 配置与启动参数。
+面向本机 AI CLI 的多项目工作台：在选定工作目录下，一键打开 **Kiro / Codex / Claude / MiMo / Grok / Shell** 多标签终端，并统一管理 API 配置与启动参数。
 
 基于 **Tauri 2 + xterm.js + portable-pty**。
 
@@ -16,6 +16,7 @@
   - `codex`
   - `claude`
   - `mimo`
+  - `grok`（通常位于 `~/.grok/bin`，应用会自动合并到 PATH）
 
 > GUI 启动时 PATH 可能不完整，应用会自动合并常见路径（`/opt/homebrew/bin`、`~/.local/bin`、`~/.cargo/bin` 等）。
 
@@ -51,7 +52,7 @@ npm run tauri build
 | 会话 | 多标签、分屏、拖拽排序、双击重命名、**重启（⌘⇧R）**、**续聊（⌘⇧T / ⌘⌥T）**、**标签右键批量关闭** |
 | 状态 | 标签三态（蓝灰空闲 / 黄执行 / 绿完成）；静默完成与退出 **系统通知** |
 | 终端 | 搜索、字号持久化、选择即复制、右键菜单、导出日志 |
-| AI 配置 | 读写 Codex/Claude/MiMo 本地配置、配置档案、连通测试 |
+| AI 配置 | 读写 Codex/Claude/MiMo/Grok 本地配置、配置档案、连通测试 |
 | 启动 | 可配置 CLI 命令、自动注入开关、注入延迟、纯 Shell |
 | 状态栏 | cwd、**Git 分支**、工具、运行状态、行列、字号 |
 
@@ -93,8 +94,9 @@ npm run tauri build
 | Codex | `codex` |
 | Claude | `claude --permission-mode bypassPermissions --tools default` |
 | MiMo | `mimo --trust --never-ask` |
+| Grok | `grok --always-approve --permission-mode bypassPermissions` |
 
-可在 **设置 → 启动参数** 中改成更保守的命令（例如仅 `claude` / `mimo`）。
+可在 **设置 → 启动参数** 中改成更保守的命令（例如仅 `claude` / `mimo` / `grok`）。
 
 ---
 
@@ -106,6 +108,7 @@ npm run tauri build
 | Codex | `~/.codex/config.toml`、`~/.codex/auth.json`（合并写入，不整文件覆盖） |
 | Claude | `~/.claude/settings.json` 的 `env` 字段（合并写入） |
 | MiMo | `~/.local/share/mimocode/auth.json`、`~/.mimocode/config.toml` |
+| Grok | `~/.grok/config.toml`（`[models]` / `[endpoints]` / `[model.<id>]` 合并写入） |
 
 保存 AI 配置后，**已打开的会话不会自动重读**；请新建会话生效。
 
@@ -115,7 +118,7 @@ npm run tauri build
 
 - 应用会启动本地 shell / AI CLI，并写入你本机的 CLI 配置文件。
 - API Key 在界面中默认遮罩显示；仍以明文形式写在各工具自己的配置文件中（与 CLI 生态一致）。
-- Claude/MiMo 默认启用最高权限（bypass / trust / never-ask）；可在设置中改保守。
+- Claude/MiMo/Grok 默认启用最高权限（bypass / trust / always-approve）；可在设置中改保守。
 - 关闭标签或退出应用时会终止对应 PTY 子进程。
 
 ---
@@ -130,6 +133,7 @@ npm run tauri build
 | Kiro | `kiro-cli --resume` | `kiro-cli --resume-picker` |
 | Claude | `claude --continue` | `claude --resume` |
 | MiMo | `mimo --continue --trust --never-ask` | 进入 MiMo TUI 后自选 |
+| Grok | `grok --continue --always-approve --permission-mode bypassPermissions` | `grok --resume …` / 应用内选会话 |
 
 入口：工具栏 **↩ 续聊 / ☰ 选会话**、命令面板「续聊…」、快捷键 `⌘⇧T` / `⌘⌥T`。  
 设置里勾选 **启动时恢复上次会话列表** 时，AI 标签会默认用「最近会话」resume 拉起（可接着调用工具与上下文）。
@@ -141,7 +145,8 @@ npm run tauri build
 **创建会话提示找不到命令**
 
 1. 设置 → 通用 → 重新检测 CLI  
-2. 确认 CLI 已安装：`which codex` / `which claude` …  
+2. 确认 CLI 已安装：`which codex` / `which claude` / `which grok` …  
+   Grok 默认在 `~/.grok/bin/grok`，应用会自动把该目录并入 PATH。
 3. 可先用 **+ Shell**，在终端里手动执行命令排查 PATH  
 
 **自动启动的 CLI 没起来**

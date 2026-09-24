@@ -125,6 +125,7 @@ const KIND_LABEL = {
   codex: "Codex",
   claude: "Claude",
   mimo: "MiMo",
+  grok: "Grok",
   shell: "Shell",
 };
 
@@ -1145,6 +1146,16 @@ function attachTerminalInteractions(session) {
     }
   });
 
+  // 点击终端区域时抢回焦点（避免焦点落在 body/侧栏后必须 Tab 才能输入）
+  pane.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    if (session.id !== activeId && session.id !== splitId) {
+      activate(session.id);
+    } else {
+      ensureTerminalFocus(session);
+    }
+  });
+
   pane.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     activate(session.id);
@@ -1295,9 +1306,11 @@ function syncImeTextarea(session) {
 }
 
 /**
- * 中文输入法英文态下，仅少数标点（尤其 ?）会因 keyCode=229 丢失。
+ * 中文输入法英文/大写态下，标点（尤其 ?）在 WebView + xterm 中常丢失：
+ * - keyCode=229 时 CompositionHelper 走 textarea diff，但 WebView 不改 textarea
+ * - 或 key 为 Process / Unidentified，evaluateKeyboardEvent 得不到字符
+ * 注意：即使 event.key 已是 "?"，keyCode 仍可能是 229，不能因为 key 明确就跳过兜底。
  * 切勿对 a-z 等普通字符强制写入：会与 xterm 正常路径双发，表现为「字间空格/重字」。
- * 策略：只拦截「需要兜底的标点」；普通字母完全交给 xterm。
  */
 const IME_PUNCTUATION_CODE_MAP = {
   Slash: ["/", "?"],
@@ -1323,11 +1336,21 @@ const IME_PUNCTUATION_CODE_MAP = {
   Digit0: ["0", ")"],
 };
 
+const IME_PUNCTUATION_CHARS = "?/!@#$%^&*()_+-=[]{}\\|;:'\",.<>`~";
+
 function isAsciiLetterOrDigitKey(event) {
   const key = event?.key || "";
+  // 仅当 key 本身就是字母数字时才跳过；Process/Unidentified 时 code 可能是 KeyA，
+  // 不能据此跳过（否则 IME 英文态字母/数字也有可能丢，但字母通常走 input 路径）。
   if (key.length === 1 && /[A-Za-z0-9]/.test(key)) return true;
-  const code = event?.code || "";
-  return /^Key[A-Z]$/.test(code) || /^Digit[0-9]$/.test(code);
+  return false;
+}
+
+function isImeLikeKeyEvent(event) {
+  if (!event) return false;
+  const key = event.key || "";
+  const keyCode = event.keyCode || event.which || 0;
+  return keyCode === 229 || key === "Process" || key === "Unidentified" || !key;
 }
 
 function resolveImePunctuationCharacter(event) {
@@ -1339,12 +1362,11 @@ function resolveImePunctuationCharacter(event) {
   const pair = IME_PUNCTUATION_CODE_MAP[code];
   if (pair) return shifted ? pair[1] : pair[0];
   const keyCode = event.keyCode || event.which || 0;
+  // Slash 在部分布局 keyCode 为 191；229 时不能用 keyCode 还原
   if (keyCode === 191) return shifted ? "?" : "/";
-  // 仅当 key 本身就是我们关心的标点时才采用（避免把字母当兜底）
   const key = event.key;
-  if (key && key.length === 1 && !/[A-Za-z0-9\s]/.test(key)) {
-    // 常见易丢标点
-    if ("?/!@#$%^&*()_+-=[]{}\\|;:'\",.<>`~".includes(key)) return key;
+  if (key && key.length === 1 && IME_PUNCTUATION_CHARS.includes(key)) {
+    return key;
   }
   return null;
 }
@@ -1355,23 +1377,32 @@ function shouldForceImePunctuation(event) {
   if (event.isComposing) return false;
   // 字母数字绝不强制，防止双发
   if (isAsciiLetterOrDigitKey(event)) return false;
+
+  const character = resolveImePunctuationCharacter(event);
+  if (!character) return false;
+
+  const key = event.key || "";
   const keyCode = event.keyCode || event.which || 0;
-  const imeLike =
-    keyCode === 229 ||
-    event.key === "Process" ||
-    event.key === "Unidentified";
   const isSlash =
     event.code === "Slash" || keyCode === 191 || event.which === 191;
   const isMappedPunctuation = Boolean(IME_PUNCTUATION_CODE_MAP[event.code || ""]);
-  // 仅 IME 异常态 + 标点键，或 Slash 在 Unidentified 时
-  if (imeLike && (isMappedPunctuation || isSlash)) return true;
-  if (isSlash && (!event.key || event.key.length !== 1)) return true;
+  const imeLike = isImeLikeKeyEvent(event);
+
+  // IME 异常态 + 标点（含 key 已是 "?" 但 keyCode=229 的情况）
+  if (imeLike && (isMappedPunctuation || isSlash || IME_PUNCTUATION_CHARS.includes(key))) {
+    return true;
+  }
+  // Slash 无有效 key 时强制（少数 WebView 不报 229）
+  if (isSlash && (!key || key.length !== 1 || key === "Process" || key === "Unidentified")) {
+    return true;
+  }
   return false;
 }
 
 function writeForcedSessionCharacter(session, character) {
   if (!session || session.exited || !character) return false;
   const now = Date.now();
+  // 同一按键可能同时命中 customKeyHandler 与 capture，短窗口去重
   if (
     session._lastForcedChar === character &&
     now - (session._lastForcedAt || 0) < 40
@@ -1412,9 +1443,11 @@ function attachImePunctuationFix(session) {
     event.stopImmediatePropagation?.();
   };
 
+  // 捕获阶段先于 xterm CompositionHelper，避免 229 被吞掉后无字符
   textarea.addEventListener("keydown", onKeyDownCapture, true);
   session.imePunctuationHandler = onKeyDownCapture;
 
+  // xterm 内部 keydown 也会走 custom handler；返回 false 阻止其默认处理（防双发）
   try {
     term.attachCustomKeyEventHandler((event) => {
       if (handleForcedPunctuation(event)) return false;
@@ -1423,6 +1456,23 @@ function attachImePunctuationFix(session) {
   } catch (_) {
     /* older xterm */
   }
+}
+
+/**
+ * 确保终端可接收键盘：点 pane / 输出后若焦点落在 body 上，按键会丢失；
+ * 用户常表现为「要按 Tab 才能继续输入」。
+ */
+function ensureTerminalFocus(session) {
+  if (!session || session.exited) return;
+  const textarea = session.term?.textarea;
+  if (!textarea) {
+    session.term?.focus();
+    return;
+  }
+  if (document.activeElement === textarea) return;
+  // 侧栏筛选、设置、搜索等编辑框持有焦点时不抢
+  if (isEditableTarget(document.activeElement)) return;
+  session.term.focus();
 }
 
 function attachImeTextareaSync(session) {
@@ -1720,7 +1770,7 @@ async function loadResumeHistoryList() {
     const items = await invoke("list_ai_sessions", {
       kind: resumePickerKind,
       cwd: cwdArg,
-      limit: 50,
+      limit: 15,
     });
     resumeHistoryItems = Array.isArray(items) ? items : [];
     resumeHistoryLoading = false;
@@ -2066,6 +2116,8 @@ function buildResumeLaunchCommand(kind, mode = "last", sessionId = null) {
         return `claude --resume ${explicitId}`;
       case "mimo":
         return `mimo --session ${explicitId} --trust --never-ask`;
+      case "grok":
+        return `grok --resume ${explicitId} --always-approve --permission-mode bypassPermissions`;
       default:
         return null;
     }
@@ -2086,6 +2138,11 @@ function buildResumeLaunchCommand(kind, mode = "last", sessionId = null) {
       return resumeMode === "picker"
         ? "mimo --trust --never-ask"
         : "mimo --continue --trust --never-ask";
+    case "grok":
+      // Grok：-c / --continue 最近；--resume 无 ID 时恢复最近；最高权限一并注入
+      return resumeMode === "picker"
+        ? "grok --resume --always-approve --permission-mode bypassPermissions"
+        : "grok --continue --always-approve --permission-mode bypassPermissions";
     default:
       return null;
   }
@@ -2251,12 +2308,20 @@ async function newSession(kind, options = {}) {
   session.unlistenOutput = await listen(`pty://output/${id}`, (event) => {
     const payload = event.payload;
     let byteLength = 0;
+    // 写入前记录视口是否处于底部；输出过快时 xterm 内部的自动跟随可能跟不上，
+    // 写入完成回调（真正渲染落盘后）里如果之前在底部就强制贴底，避免卡在中间需手动点按钮。
+    const buffer = term.buffer.active;
+    const wasAtBottom = buffer.viewportY >= buffer.baseY;
     if (payload instanceof Array) {
       byteLength = payload.length;
-      term.write(new Uint8Array(payload));
+      term.write(new Uint8Array(payload), () => {
+        if (wasAtBottom) term.scrollToBottom();
+      });
     } else if (typeof payload === "string") {
       byteLength = payload.length;
-      term.write(payload);
+      term.write(payload, () => {
+        if (wasAtBottom) term.scrollToBottom();
+      });
     }
     markSessionOutput(session, byteLength);
   });
@@ -2545,6 +2610,8 @@ function fillLaunchForm() {
     launch.claude || "claude --permission-mode bypassPermissions --tools default";
   document.getElementById("launch-mimo").value =
     launch.mimo || "mimo --trust --never-ask";
+  document.getElementById("launch-grok").value =
+    launch.grok || "grok --always-approve --permission-mode bypassPermissions";
 }
 
 document.getElementById("save-launch-btn").addEventListener("click", async () => {
@@ -2559,6 +2626,9 @@ document.getElementById("save-launch-btn").addEventListener("click", async () =>
           codex: document.getElementById("launch-codex").value.trim() || "codex",
           claude: document.getElementById("launch-claude").value.trim() || "claude",
           mimo: document.getElementById("launch-mimo").value.trim() || "mimo",
+          grok:
+            document.getElementById("launch-grok").value.trim() ||
+            "grok --always-approve --permission-mode bypassPermissions",
         },
       },
     });
@@ -2757,10 +2827,13 @@ function buildPaletteCommands() {
     { id: "resume-claude-pick", label: "续聊 Claude（选择会话）", keys: "", run: () => resumePickerSession("claude") },
     { id: "resume-mimo-last", label: "续聊 MiMo（最近）", keys: "", run: () => resumeLastSession("mimo") },
     { id: "resume-mimo-pick", label: "续聊 MiMo（选择会话）", keys: "", run: () => resumePickerSession("mimo") },
+    { id: "resume-grok-last", label: "续聊 Grok（最近）", keys: "", run: () => resumeLastSession("grok") },
+    { id: "resume-grok-pick", label: "续聊 Grok（选择会话）", keys: "", run: () => resumePickerSession("grok") },
     { id: "new-codex", label: "新建 Codex", keys: "", run: () => newSession("codex") },
     { id: "new-claude", label: "新建 Claude", keys: "", run: () => newSession("claude") },
     { id: "new-kiro", label: "新建 Kiro", keys: "⌘⇧K", run: () => newSession("kiro") },
     { id: "new-mimo", label: "新建 MiMo", keys: "", run: () => newSession("mimo") },
+    { id: "new-grok", label: "新建 Grok", keys: "", run: () => newSession("grok") },
     { id: "new-shell", label: "新建 Shell", keys: "", run: () => newSession("shell") },
     { id: "close", label: "关闭当前会话", keys: "⌘W", run: () => activeId && closeSession(activeId) },
     {
@@ -2945,6 +3018,46 @@ window.addEventListener("keydown", (event) => {
     if (!searchBar.hidden) {
       closeSearch();
       return;
+    }
+  }
+
+  // 焦点不在终端 textarea 时：拉回焦点；当前这次按键不会进 xterm，需补写
+  if (
+    !modKey(event) &&
+    !event.altKey &&
+    activeId &&
+    !isEditableTarget(event.target) &&
+    !event.isComposing
+  ) {
+    const modalOpen =
+      (settingsModal && !settingsModal.hidden) ||
+      (commandPalette && !commandPalette.hidden) ||
+      (confirmModal && !confirmModal.hidden) ||
+      (resumeModal && !resumeModal.hidden) ||
+      (searchBar && !searchBar.hidden);
+    if (!modalOpen) {
+      const session = sessions.get(activeId);
+      const textarea = session?.term?.textarea;
+      if (session && textarea && document.activeElement !== textarea) {
+        ensureTerminalFocus(session);
+        if (!session.exited) {
+          const key = event.key || "";
+          let ch = null;
+          if (key === "Enter") ch = "\r";
+          else if (key === "Backspace") ch = "\x7f";
+          else if (key === "Tab") ch = "\t";
+          else if (key === "Escape") ch = "\x1b";
+          else if (key.length === 1 && /[\x20-\x7e]/.test(key)) ch = key;
+          else if (shouldForceImePunctuation(event)) {
+            ch = resolveImePunctuationCharacter(event);
+          }
+          if (ch) {
+            writeForcedSessionCharacter(session, ch);
+            event.preventDefault();
+            return;
+          }
+        }
+      }
     }
   }
 

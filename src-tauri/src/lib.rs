@@ -3,12 +3,12 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 /// 单个 PTY 会话持有的资源
@@ -30,6 +30,8 @@ struct LaunchArgs {
     claude: String,
     #[serde(default = "default_mimo_args")]
     mimo: String,
+    #[serde(default = "default_grok_args")]
+    grok: String,
 }
 
 fn default_kiro_args() -> String {
@@ -44,6 +46,10 @@ fn default_claude_args() -> String {
 fn default_mimo_args() -> String {
     "mimo --trust --never-ask".into()
 }
+fn default_grok_args() -> String {
+    // 最高权限：auto-approve 全部工具 + bypassPermissions（与 Claude/MiMo 策略一致）
+    "grok --always-approve --permission-mode bypassPermissions".into()
+}
 
 impl Default for LaunchArgs {
     fn default() -> Self {
@@ -52,6 +58,7 @@ impl Default for LaunchArgs {
             codex: default_codex_args(),
             claude: default_claude_args(),
             mimo: default_mimo_args(),
+            grok: default_grok_args(),
         }
     }
 }
@@ -235,6 +242,7 @@ fn enrich_path_env() {
         format!("{}/.local/bin", home),
         format!("{}/.cargo/bin", home),
         format!("{}/.npm-global/bin", home),
+        format!("{}/.grok/bin", home),
         format!("{}/bin", home),
         "/usr/local/bin".into(),
         "/opt/homebrew/bin".into(),
@@ -495,6 +503,7 @@ fn cli_binary_for_kind(kind: &str, launch_args: &LaunchArgs) -> String {
         "codex" => &launch_args.codex,
         "claude" => &launch_args.claude,
         "mimo" => &launch_args.mimo,
+        "grok" => &launch_args.grok,
         _ => kind,
     };
     line.split_whitespace().next().unwrap_or(kind).to_string()
@@ -553,7 +562,7 @@ fn check_cli(state: State<AppState>, kind: String) -> CliCheckResult {
 #[tauri::command]
 fn check_all_cli(state: State<AppState>) -> Vec<CliCheckResult> {
     let cfg = state.config.lock().clone();
-    ["kiro", "codex", "claude", "mimo"]
+    ["kiro", "codex", "claude", "mimo", "grok"]
         .iter()
         .map(|kind| check_cli_with_config(&cfg, kind))
         .collect()
@@ -678,15 +687,19 @@ fn list_codex_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<Ai
         if results.len() >= limit {
             break;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(file) = std::fs::File::open(&path) else {
             continue;
         };
+        let reader = BufReader::new(file);
         let mut session_id = extract_codex_session_id_from_filename(&path);
         let mut session_cwd: Option<String> = None;
         let mut title: Option<String> = None;
         let mut updated_at: Option<String> = None;
 
-        for line in text.lines().take(120) {
+        for line in reader.lines().take(120) {
+            let Ok(line) = line else {
+                continue;
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -769,6 +782,8 @@ fn list_codex_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<Ai
     results
 }
 
+const HISTORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn run_command_capture(program: &str, args: &[&str], cwd: Option<&str>) -> Result<String, String> {
     let mut command = Command::new(program);
     command.args(args);
@@ -780,10 +795,51 @@ fn run_command_capture(program: &str, args: &[&str], cwd: Option<&str>) -> Resul
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);
     }
-    let output = command.output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take().ok_or("无法读取命令标准输出")?;
+    let stderr = child.stderr.take().ok_or("无法读取命令错误输出")?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = BufReader::new(stdout).read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = BufReader::new(stderr).read_to_end(&mut bytes);
+        bytes
+    });
+
+    let deadline = Instant::now() + HISTORY_COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "命令执行超时（{} 秒）: {} {}",
+                    HISTORY_COMMAND_TIMEOUT.as_secs(),
+                    program,
+                    args.join(" ")
+                ));
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "读取命令标准输出失败".to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "读取命令错误输出失败".to_string())?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        let stdout = String::from_utf8_lossy(&stdout);
         return Err(format!(
             "命令失败: {} {}\n{}{}",
             program,
@@ -792,7 +848,7 @@ fn run_command_capture(program: &str, args: &[&str], cwd: Option<&str>) -> Resul
             stderr
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
 fn list_kiro_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
@@ -927,6 +983,112 @@ fn list_mimo_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiH
     results
 }
 
+/// 扫描 ~/.grok/sessions 下各 cwd 目录的会话 summary.json
+fn list_grok_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
+    let home = match user_home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let sessions_root = PathBuf::from(&home).join(".grok").join("sessions");
+    if !sessions_root.is_dir() {
+        return Vec::new();
+    }
+    let mut summaries: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd_entries) = std::fs::read_dir(&sessions_root) {
+        for cwd_entry in cwd_entries.flatten() {
+            let cwd_dir = cwd_entry.path();
+            if !cwd_dir.is_dir() {
+                continue;
+            }
+            if let Ok(session_entries) = std::fs::read_dir(&cwd_dir) {
+                for session_entry in session_entries.flatten() {
+                    let session_dir = session_entry.path();
+                    if !session_dir.is_dir() {
+                        continue;
+                    }
+                    let summary = session_dir.join("summary.json");
+                    if summary.is_file() {
+                        summaries.push(summary);
+                    }
+                }
+            }
+        }
+    }
+    summaries.sort_by(|left, right| {
+        let left_time = std::fs::metadata(left)
+            .and_then(|m| m.modified())
+            .ok();
+        let right_time = std::fs::metadata(right)
+            .and_then(|m| m.modified())
+            .ok();
+        right_time.cmp(&left_time)
+    });
+    let mut results = Vec::new();
+    for path in summaries {
+        if results.len() >= limit {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let id = value
+            .pointer("/info/id")
+            .or_else(|| value.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let session_cwd = value
+            .pointer("/info/cwd")
+            .or_else(|| value.get("cwd"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if filter_cwd.is_some()
+            && session_cwd.is_some()
+            && !path_matches_filter(session_cwd.as_deref(), filter_cwd)
+        {
+            continue;
+        }
+        let title = value
+            .get("generated_title")
+            .or_else(|| value.get("session_summary"))
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_title(s, 80))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Grok 会话".into());
+        let updated_at = value
+            .get("updated_at")
+            .or_else(|| value.get("last_active_at"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs().to_string())
+            });
+        results.push(AiHistorySession {
+            id,
+            title,
+            cwd: session_cwd.or_else(|| filter_cwd.map(|s| s.to_string())),
+            updated_at,
+            source: "grok".into(),
+        });
+    }
+    results
+}
+
 fn list_claude_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
     let home = match user_home_dir() {
         Some(h) => h,
@@ -974,12 +1136,16 @@ fn list_claude_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<A
         if id.is_empty() {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(file) = std::fs::File::open(&path) else {
             continue;
         };
+        let reader = BufReader::new(file);
         let mut session_cwd: Option<String> = None;
         let mut title: Option<String> = None;
-        for line in text.lines().take(40) {
+        for line in reader.lines().take(40) {
+            let Ok(line) = line else {
+                continue;
+            };
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                 continue;
             };
@@ -1038,6 +1204,7 @@ fn list_ai_sessions(
         "kiro" => list_kiro_history_sessions(filter, max_items),
         "mimo" => list_mimo_history_sessions(filter, max_items),
         "claude" => list_claude_history_sessions(filter, max_items),
+        "grok" => list_grok_history_sessions(filter, max_items),
         _ => return Err(format!("不支持列出历史会话的工具: {kind}")),
     };
     Ok(list)
@@ -1191,6 +1358,7 @@ fn create_session(
                 "codex" => Some(cfg_snapshot.launch_args.codex.clone()),
                 "claude" => Some(cfg_snapshot.launch_args.claude.clone()),
                 "mimo" => Some(cfg_snapshot.launch_args.mimo.clone()),
+                "grok" => Some(cfg_snapshot.launch_args.grok.clone()),
                 "shell" => None,
                 _ => None,
             }
@@ -1383,6 +1551,102 @@ fn read_ai_config(tool: String) -> Result<AiToolConfig, String> {
                 model,
             })
         }
+        "grok" => {
+            // ~/.grok/config.toml：顶层 [models] default、[endpoints] models_base_url、
+            // 以及 [model.<id>] 段内的 base_url / api_key
+            let config_path = format!("{}/.grok/config.toml", home);
+            let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+            let mut model = String::new();
+            let mut base_url = String::new();
+            let mut api_key = String::new();
+            let mut current_section = String::new();
+            let mut model_section_api_key = String::new();
+            let mut model_section_base_url = String::new();
+            for line in config_text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    current_section = trimmed[1..trimmed.len() - 1].to_string();
+                    continue;
+                }
+                if let Some((raw_key, raw_val)) = trimmed.split_once('=') {
+                    let key = raw_key.trim();
+                    let val = raw_val
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+                    match current_section.as_str() {
+                        "models" if key == "default" => model = val,
+                        "endpoints" if key == "models_base_url" => {
+                            if base_url.is_empty() {
+                                base_url = val;
+                            }
+                        }
+                        s if s.starts_with("model.") => {
+                            if key == "api_key" && model_section_api_key.is_empty() {
+                                model_section_api_key = val;
+                            } else if key == "base_url" && model_section_base_url.is_empty() {
+                                model_section_base_url = val;
+                            } else if key == "api_key" {
+                                // 优先匹配当前 default 模型对应的 section
+                                let section_model = s.strip_prefix("model.").unwrap_or("");
+                                if !model.is_empty() && section_model == model {
+                                    model_section_api_key = val;
+                                }
+                            } else if key == "base_url" {
+                                let section_model = s.strip_prefix("model.").unwrap_or("");
+                                if !model.is_empty() && section_model == model {
+                                    model_section_base_url = val;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // 再扫一遍，确保 default 模型 section 的 key 覆盖兜底值
+            if !model.is_empty() {
+                current_section.clear();
+                let target = format!("model.{}", model);
+                for line in config_text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                        current_section = trimmed[1..trimmed.len() - 1].to_string();
+                        continue;
+                    }
+                    if current_section != target {
+                        continue;
+                    }
+                    if let Some((raw_key, raw_val)) = trimmed.split_once('=') {
+                        let key = raw_key.trim();
+                        let val = raw_val
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string();
+                        if key == "api_key" {
+                            model_section_api_key = val;
+                        } else if key == "base_url" {
+                            model_section_base_url = val;
+                        }
+                    }
+                }
+            }
+            if !model_section_base_url.is_empty() {
+                base_url = model_section_base_url;
+            }
+            if !model_section_api_key.is_empty() {
+                api_key = model_section_api_key;
+            }
+            Ok(AiToolConfig {
+                base_url,
+                api_key,
+                model,
+            })
+        }
         _ => Err(format!("未知工具类型: {}", tool)),
     }
 }
@@ -1511,6 +1775,63 @@ fn write_ai_config(tool: String, config: AiToolConfig) -> Result<(), String> {
                 }
                 atomic_write(Path::new(&mimo_config_path), &content)?;
             }
+        }
+        "grok" => {
+            let config_path = format!("{}/.grok/config.toml", home);
+            let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
+            if !config.model.is_empty() {
+                content =
+                    update_toml_section_value(&content, "models", "default", &config.model);
+            }
+            if !config.base_url.is_empty() {
+                content = update_toml_section_value(
+                    &content,
+                    "endpoints",
+                    "models_base_url",
+                    &config.base_url,
+                );
+            }
+            // 写入 / 更新 [model.<id>] 段，保证该模型有 base_url / api_key
+            let model_id = if config.model.is_empty() {
+                // 从现有配置读 default
+                let mut default_model = String::new();
+                let mut in_models = false;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with('[') {
+                        in_models = trimmed == "[models]";
+                        continue;
+                    }
+                    if in_models {
+                        if let Some(v) = trimmed.strip_prefix("default = ") {
+                            default_model = v.trim_matches('"').trim_matches('\'').to_string();
+                            break;
+                        }
+                    }
+                }
+                if default_model.is_empty() {
+                    "grok-4.5".into()
+                } else {
+                    default_model
+                }
+            } else {
+                config.model.clone()
+            };
+            let section = format!("model.{}", model_id);
+            if !config.base_url.is_empty() {
+                content =
+                    update_toml_section_value(&content, &section, "base_url", &config.base_url);
+                // 同步 model 字段，便于 CLI 识别
+                content = update_toml_section_value(&content, &section, "model", &model_id);
+            }
+            if !config.api_key.is_empty() {
+                content =
+                    update_toml_section_value(&content, &section, "api_key", &config.api_key);
+            }
+            if let Some(parent) = Path::new(&config_path).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            atomic_write(Path::new(&config_path), &content)?;
         }
         _ => return Err(format!("未知工具类型: {}", tool)),
     }
