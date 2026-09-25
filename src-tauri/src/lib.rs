@@ -3,18 +3,20 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 /// 单个 PTY 会话持有的资源
 struct PtySession {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// 独立锁：PTY 缓冲满导致的阻塞写只卡住本会话，不再冻结全局会话表
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -30,6 +32,8 @@ struct LaunchArgs {
     claude: String,
     #[serde(default = "default_mimo_args")]
     mimo: String,
+    #[serde(default = "default_grok_args")]
+    grok: String,
 }
 
 fn default_kiro_args() -> String {
@@ -44,6 +48,10 @@ fn default_claude_args() -> String {
 fn default_mimo_args() -> String {
     "mimo --trust --never-ask".into()
 }
+fn default_grok_args() -> String {
+    // 最高权限：auto-approve 全部工具 + bypassPermissions（与 Claude/MiMo 策略一致）
+    "grok --always-approve --permission-mode bypassPermissions".into()
+}
 
 impl Default for LaunchArgs {
     fn default() -> Self {
@@ -52,6 +60,7 @@ impl Default for LaunchArgs {
             codex: default_codex_args(),
             claude: default_claude_args(),
             mimo: default_mimo_args(),
+            grok: default_grok_args(),
         }
     }
 }
@@ -64,7 +73,11 @@ struct ConfigProfile {
     name: String,
     tool: String,
     base_url: String,
+    /// apiKey 不落盘：保存时转存系统钥匙串，本字段仅作为读取时的回填载体
     api_key: String,
+    /// 标记 apiKey 已托管到系统钥匙串（旧版本 JSON 中的明文会在加载时迁移）
+    #[serde(default)]
+    api_key_in_keychain: bool,
     model: String,
 }
 
@@ -78,6 +91,12 @@ struct SessionSnapshot {
     /// 启动时续聊模式：last / picker；空表示新建会话
     #[serde(default)]
     resume_mode: Option<String>,
+    /// 绑定的 CLI 会话 ID：选会话/续聊后记录，恢复与重启用它精确接回同一对话
+    #[serde(default)]
+    cli_session_id: Option<String>,
+    /// 受限模式（不带 bypass/trust 参数），恢复后保持同一权限档位
+    #[serde(default)]
+    restricted: Option<bool>,
 }
 
 /// 应用完整配置（目录 + 偏好 + 启动参数 + 档案）
@@ -222,19 +241,22 @@ fn user_home_dir() -> Option<String> {
 
 /// GUI 应用启动时常缺少用户 shell PATH，合并常见路径
 fn enrich_path_env() {
+    let sep: char = if cfg!(windows) { ';' } else { ':' };
     let mut parts: Vec<String> = Vec::new();
     if let Ok(current) = std::env::var("PATH") {
-        for p in current.split(':') {
+        for p in current.split(sep) {
             if !p.is_empty() && !parts.iter().any(|x| x == p) {
                 parts.push(p.to_string());
             }
         }
     }
     let home = user_home_dir().unwrap_or_default();
+    #[cfg(not(windows))]
     let extras = [
         format!("{}/.local/bin", home),
         format!("{}/.cargo/bin", home),
         format!("{}/.npm-global/bin", home),
+        format!("{}/.grok/bin", home),
         format!("{}/bin", home),
         "/usr/local/bin".into(),
         "/opt/homebrew/bin".into(),
@@ -242,12 +264,19 @@ fn enrich_path_env() {
         "/usr/bin".into(),
         "/bin".into(),
     ];
+    #[cfg(windows)]
+    let extras = [
+        format!("{}\\.cargo\\bin", home),
+        format!("{}\\.local\\bin", home),
+        format!("{}\\AppData\\Roaming\\npm", home),
+        format!("{}\\.grok\\bin", home),
+    ];
     for extra in extras {
         if !extra.is_empty() && !parts.iter().any(|x| x == &extra) {
             parts.push(extra);
         }
     }
-    std::env::set_var("PATH", parts.join(":"));
+    std::env::set_var("PATH", parts.join(&sep.to_string()));
 }
 
 fn config_file(app: &AppHandle) -> Option<PathBuf> {
@@ -274,10 +303,59 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+const KEYRING_SERVICE: &str = "ai-terminal";
+
+/// 档案 apiKey 转存系统钥匙串（按 profile.id 作账号）。
+/// 钥匙串不可用（如无 Secret Service 的 Linux）时保留明文，保证功能可用。
+fn stash_profile_api_key(profile: &mut ConfigProfile) {
+    if profile.api_key.is_empty() {
+        return;
+    }
+    let account = format!("profile/{}", profile.id);
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account) {
+        if entry.set_password(&profile.api_key).is_ok() {
+            profile.api_key.clear();
+            profile.api_key_in_keychain = true;
+        }
+    }
+}
+
+/// 读取配置时把钥匙串中的 apiKey 回填给前端（前端协议不变）
+fn hydrate_profile_api_key(profile: &mut ConfigProfile) {
+    if !profile.api_key_in_keychain {
+        return;
+    }
+    let account = format!("profile/{}", profile.id);
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account) {
+        if let Ok(secret) = entry.get_password() {
+            profile.api_key = secret;
+        }
+    }
+}
+
+/// 删除已移除档案的钥匙串条目
+fn drop_profile_api_key(profile_id: &str) {
+    let account = format!("profile/{}", profile_id);
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account) {
+        let _ = entry.delete_credential();
+    }
+}
+
 fn load_config(app: &AppHandle) -> AppConfig {
     if let Some(path) = config_file(app) {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<AppConfig>(&text) {
+            if let Ok(mut cfg) = serde_json::from_str::<AppConfig>(&text) {
+                // 旧版本明文 apiKey 一次性迁移到钥匙串
+                let mut migrated = false;
+                for p in cfg.profiles.iter_mut() {
+                    if !p.api_key.is_empty() {
+                        stash_profile_api_key(p);
+                        migrated = migrated || p.api_key_in_keychain;
+                    }
+                }
+                if migrated {
+                    let _ = save_config(app, &cfg);
+                }
                 return cfg;
             }
         }
@@ -309,9 +387,16 @@ fn push_recent(cfg: &mut AppConfig, dir: &str) {
 }
 
 fn kill_all_sessions(state: &AppState) {
-    let mut map = state.sessions.lock();
-    for (_id, mut sess) in map.drain() {
+    // 先一次性取出全部会话再放锁：kill/wait 是阻塞调用，不应持有全局会话锁
+    let mut drained: Vec<PtySession> = {
+        let mut map = state.sessions.lock();
+        map.drain().map(|(_, sess)| sess).collect()
+    };
+    for sess in drained.iter_mut() {
         let _ = sess.child.kill();
+    }
+    for sess in drained.iter_mut() {
+        let _ = sess.child.wait();
     }
 }
 
@@ -319,12 +404,20 @@ fn kill_all_sessions(state: &AppState) {
 
 #[tauri::command]
 fn get_dir_config(state: State<AppState>) -> AppConfig {
-    state.config.lock().clone()
+    let mut cfg = state.config.lock().clone();
+    for p in cfg.profiles.iter_mut() {
+        hydrate_profile_api_key(p);
+    }
+    cfg
 }
 
 #[tauri::command]
 fn get_app_config(state: State<AppState>) -> AppConfig {
-    state.config.lock().clone()
+    let mut cfg = state.config.lock().clone();
+    for p in cfg.profiles.iter_mut() {
+        hydrate_profile_api_key(p);
+    }
+    cfg
 }
 
 /// 部分更新偏好（字号、启动参数、侧栏、恢复等）
@@ -354,13 +447,15 @@ fn normalize_ui_theme(theme: &str) -> String {
 }
 
 #[tauri::command]
-fn update_prefs(
+async fn update_prefs(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     patch: PrefsPatch,
 ) -> Result<AppConfig, String> {
-    let snapshot = {
-        let mut cfg = state.config.lock();
+    let config = Arc::clone(&state.config);
+    tauri::async_runtime::spawn_blocking(move || {
+        // 「修改 + 落盘」在同一把锁内完成：保证写顺序与修改顺序一致，避免旧快照覆盖新修改
+        let mut cfg = config.lock();
         if let Some(v) = patch.font_size {
             cfg.font_size = v.clamp(10, 28);
         }
@@ -385,7 +480,16 @@ fn update_prefs(
         if let Some(v) = patch.restore_sessions {
             cfg.restore_sessions = v;
         }
-        if let Some(v) = patch.profiles {
+        if let Some(mut v) = patch.profiles {
+            // apiKey 转存钥匙串，JSON 中只留标记；顺带清理被删除档案的钥匙串条目
+            for p in v.iter_mut() {
+                stash_profile_api_key(p);
+            }
+            for old in cfg.profiles.iter().filter(|o| {
+                o.api_key_in_keychain && !v.iter().any(|n| n.id == o.id)
+            }) {
+                drop_profile_api_key(&old.id);
+            }
             cfg.profiles = v;
         }
         if let Some(v) = patch.copy_on_select {
@@ -394,87 +498,104 @@ fn update_prefs(
         if let Some(v) = patch.ui_theme {
             cfg.ui_theme = normalize_ui_theme(&v);
         }
-        cfg.clone()
-    };
-    save_config(&app, &snapshot)?;
-    Ok(snapshot)
+        let snapshot = cfg.clone();
+        save_config(&app, &snapshot)?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn set_default_dir(
+async fn set_default_dir(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     dir: String,
 ) -> Result<AppConfig, String> {
-    let snapshot = {
-        let mut cfg = state.config.lock();
+    let config = Arc::clone(&state.config);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cfg = config.lock();
         cfg.default_dir = Some(dir.clone());
         push_recent(&mut cfg, &dir);
-        cfg.clone()
-    };
-    save_config(&app, &snapshot)?;
-    Ok(snapshot)
+        let snapshot = cfg.clone();
+        save_config(&app, &snapshot)?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn add_recent_dir(
+async fn add_recent_dir(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     dir: String,
 ) -> Result<AppConfig, String> {
-    let snapshot = {
-        let mut cfg = state.config.lock();
+    let config = Arc::clone(&state.config);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cfg = config.lock();
         push_recent(&mut cfg, &dir);
-        cfg.clone()
-    };
-    save_config(&app, &snapshot)?;
-    Ok(snapshot)
+        let snapshot = cfg.clone();
+        save_config(&app, &snapshot)?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn remove_recent_dir(
+async fn remove_recent_dir(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     dir: String,
 ) -> Result<AppConfig, String> {
-    let snapshot = {
-        let mut cfg = state.config.lock();
+    let config = Arc::clone(&state.config);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cfg = config.lock();
         cfg.recent_dirs.retain(|d| d != &dir);
-        cfg.clone()
-    };
-    save_config(&app, &snapshot)?;
-    Ok(snapshot)
+        let snapshot = cfg.clone();
+        save_config(&app, &snapshot)?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn clear_recent_dirs(app: AppHandle, state: State<AppState>) -> Result<AppConfig, String> {
-    let snapshot = {
-        let mut cfg = state.config.lock();
+async fn clear_recent_dirs(app: AppHandle, state: State<'_, AppState>) -> Result<AppConfig, String> {
+    let config = Arc::clone(&state.config);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cfg = config.lock();
         cfg.recent_dirs.clear();
-        cfg.clone()
-    };
-    save_config(&app, &snapshot)?;
-    Ok(snapshot)
+        let snapshot = cfg.clone();
+        save_config(&app, &snapshot)?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn toggle_pin_dir(
+async fn toggle_pin_dir(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     dir: String,
 ) -> Result<AppConfig, String> {
-    let snapshot = {
-        let mut cfg = state.config.lock();
+    let config = Arc::clone(&state.config);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cfg = config.lock();
         if cfg.pinned_dirs.iter().any(|d| d == &dir) {
             cfg.pinned_dirs.retain(|d| d != &dir);
         } else {
             cfg.pinned_dirs.insert(0, dir);
             cfg.pinned_dirs.truncate(20);
         }
-        cfg.clone()
-    };
-    save_config(&app, &snapshot)?;
-    Ok(snapshot)
+        let snapshot = cfg.clone();
+        save_config(&app, &snapshot)?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------- CLI 健康检查 ----------
@@ -495,6 +616,7 @@ fn cli_binary_for_kind(kind: &str, launch_args: &LaunchArgs) -> String {
         "codex" => &launch_args.codex,
         "claude" => &launch_args.claude,
         "mimo" => &launch_args.mimo,
+        "grok" => &launch_args.grok,
         _ => kind,
     };
     line.split_whitespace().next().unwrap_or(kind).to_string()
@@ -545,18 +667,41 @@ fn check_cli_with_config(cfg: &AppConfig, kind: &str) -> CliCheckResult {
 }
 
 #[tauri::command]
-fn check_cli(state: State<AppState>, kind: String) -> CliCheckResult {
+async fn check_cli(state: State<'_, AppState>, kind: String) -> Result<CliCheckResult, String> {
     let cfg = state.config.lock().clone();
-    check_cli_with_config(&cfg, &kind)
+    tauri::async_runtime::spawn_blocking(move || check_cli_with_config(&cfg, &kind))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn check_all_cli(state: State<AppState>) -> Vec<CliCheckResult> {
+async fn check_all_cli(state: State<'_, AppState>) -> Result<Vec<CliCheckResult>, String> {
     let cfg = state.config.lock().clone();
-    ["kiro", "codex", "claude", "mimo"]
-        .iter()
-        .map(|kind| check_cli_with_config(&cfg, kind))
-        .collect()
+    tauri::async_runtime::spawn_blocking(move || {
+        // 5 个 CLI 检测并行：每个都是 spawn 子进程，串行等待是白耗
+        let kinds = ["kiro", "codex", "claude", "mimo", "grok"];
+        let cfg_ref = &cfg;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = kinds
+                .iter()
+                .map(|kind| scope.spawn(move || check_cli_with_config(cfg_ref, kind)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| CliCheckResult {
+                        kind: "unknown".into(),
+                        command: String::new(),
+                        available: false,
+                        path: None,
+                        message: "内部错误".into(),
+                    })
+                })
+                .collect()
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---------- AI 历史会话列表（应用内续聊选择）----------
@@ -663,30 +808,35 @@ fn list_codex_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<Ai
         }
     }
 
-    files.sort_by(|left, right| {
-        let left_time = std::fs::metadata(left)
-            .and_then(|m| m.modified())
-            .ok();
-        let right_time = std::fs::metadata(right)
-            .and_then(|m| m.modified())
-            .ok();
-        right_time.cmp(&left_time)
-    });
+    // 先取一次 mtime 再排序：比较器内做 stat 会产生 O(n·log n) 次系统调用
+    let mut with_mtime: Vec<(PathBuf, Option<std::time::SystemTime>)> = files
+        .into_iter()
+        .map(|p| {
+            let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+            (p, t)
+        })
+        .collect();
+    with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
+    let files: Vec<PathBuf> = with_mtime.into_iter().map(|(p, _)| p).collect();
 
     let mut results = Vec::new();
     for path in files {
         if results.len() >= limit {
             break;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(file) = std::fs::File::open(&path) else {
             continue;
         };
+        let reader = BufReader::new(file);
         let mut session_id = extract_codex_session_id_from_filename(&path);
         let mut session_cwd: Option<String> = None;
         let mut title: Option<String> = None;
         let mut updated_at: Option<String> = None;
 
-        for line in text.lines().take(120) {
+        for line in reader.lines().take(120) {
+            let Ok(line) = line else {
+                continue;
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -769,6 +919,8 @@ fn list_codex_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<Ai
     results
 }
 
+const HISTORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn run_command_capture(program: &str, args: &[&str], cwd: Option<&str>) -> Result<String, String> {
     let mut command = Command::new(program);
     command.args(args);
@@ -780,10 +932,51 @@ fn run_command_capture(program: &str, args: &[&str], cwd: Option<&str>) -> Resul
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);
     }
-    let output = command.output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take().ok_or("无法读取命令标准输出")?;
+    let stderr = child.stderr.take().ok_or("无法读取命令错误输出")?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = BufReader::new(stdout).read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = BufReader::new(stderr).read_to_end(&mut bytes);
+        bytes
+    });
+
+    let deadline = Instant::now() + HISTORY_COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "命令执行超时（{} 秒）: {} {}",
+                    HISTORY_COMMAND_TIMEOUT.as_secs(),
+                    program,
+                    args.join(" ")
+                ));
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "读取命令标准输出失败".to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "读取命令错误输出失败".to_string())?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        let stdout = String::from_utf8_lossy(&stdout);
         return Err(format!(
             "命令失败: {} {}\n{}{}",
             program,
@@ -792,7 +985,7 @@ fn run_command_capture(program: &str, args: &[&str], cwd: Option<&str>) -> Resul
             stderr
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
 fn list_kiro_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
@@ -927,6 +1120,113 @@ fn list_mimo_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiH
     results
 }
 
+/// 扫描 ~/.grok/sessions 下各 cwd 目录的会话 summary.json
+fn list_grok_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
+    let home = match user_home_dir() {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let sessions_root = PathBuf::from(&home).join(".grok").join("sessions");
+    if !sessions_root.is_dir() {
+        return Vec::new();
+    }
+    let mut summaries: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd_entries) = std::fs::read_dir(&sessions_root) {
+        for cwd_entry in cwd_entries.flatten() {
+            let cwd_dir = cwd_entry.path();
+            if !cwd_dir.is_dir() {
+                continue;
+            }
+            if let Ok(session_entries) = std::fs::read_dir(&cwd_dir) {
+                for session_entry in session_entries.flatten() {
+                    let session_dir = session_entry.path();
+                    if !session_dir.is_dir() {
+                        continue;
+                    }
+                    let summary = session_dir.join("summary.json");
+                    if summary.is_file() {
+                        summaries.push(summary);
+                    }
+                }
+            }
+        }
+    }
+    // 同上：先取 mtime 再排序
+    let mut with_mtime: Vec<(PathBuf, Option<std::time::SystemTime>)> = summaries
+        .into_iter()
+        .map(|p| {
+            let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+            (p, t)
+        })
+        .collect();
+    with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
+    let summaries: Vec<PathBuf> = with_mtime.into_iter().map(|(p, _)| p).collect();
+    let mut results = Vec::new();
+    for path in summaries {
+        if results.len() >= limit {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let id = value
+            .pointer("/info/id")
+            .or_else(|| value.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let session_cwd = value
+            .pointer("/info/cwd")
+            .or_else(|| value.get("cwd"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if filter_cwd.is_some()
+            && session_cwd.is_some()
+            && !path_matches_filter(session_cwd.as_deref(), filter_cwd)
+        {
+            continue;
+        }
+        let title = value
+            .get("generated_title")
+            .or_else(|| value.get("session_summary"))
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_title(s, 80))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Grok 会话".into());
+        let updated_at = value
+            .get("updated_at")
+            .or_else(|| value.get("last_active_at"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs().to_string())
+            });
+        results.push(AiHistorySession {
+            id,
+            title,
+            cwd: session_cwd.or_else(|| filter_cwd.map(|s| s.to_string())),
+            updated_at,
+            source: "grok".into(),
+        });
+    }
+    results
+}
+
 fn list_claude_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiHistorySession> {
     let home = match user_home_dir() {
         Some(h) => h,
@@ -953,15 +1253,16 @@ fn list_claude_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<A
             }
         }
     }
-    files.sort_by(|left, right| {
-        let left_time = std::fs::metadata(left)
-            .and_then(|m| m.modified())
-            .ok();
-        let right_time = std::fs::metadata(right)
-            .and_then(|m| m.modified())
-            .ok();
-        right_time.cmp(&left_time)
-    });
+    // 同上：先取 mtime 再排序
+    let mut with_mtime: Vec<(PathBuf, Option<std::time::SystemTime>)> = files
+        .into_iter()
+        .map(|p| {
+            let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+            (p, t)
+        })
+        .collect();
+    with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
+    let files: Vec<PathBuf> = with_mtime.into_iter().map(|(p, _)| p).collect();
     let mut results = Vec::new();
     for path in files {
         if results.len() >= limit {
@@ -974,12 +1275,16 @@ fn list_claude_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<A
         if id.is_empty() {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(file) = std::fs::File::open(&path) else {
             continue;
         };
+        let reader = BufReader::new(file);
         let mut session_cwd: Option<String> = None;
         let mut title: Option<String> = None;
-        for line in text.lines().take(40) {
+        for line in reader.lines().take(40) {
+            let Ok(line) = line else {
+                continue;
+            };
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                 continue;
             };
@@ -1026,244 +1331,299 @@ fn list_claude_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<A
 }
 
 #[tauri::command]
-fn list_ai_sessions(
+async fn list_ai_sessions(
     kind: String,
     cwd: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<AiHistorySession>, String> {
-    let max_items = limit.unwrap_or(40).clamp(1, 100) as usize;
-    let filter = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let list = match kind.as_str() {
-        "codex" => list_codex_history_sessions(filter, max_items),
-        "kiro" => list_kiro_history_sessions(filter, max_items),
-        "mimo" => list_mimo_history_sessions(filter, max_items),
-        "claude" => list_claude_history_sessions(filter, max_items),
-        _ => return Err(format!("不支持列出历史会话的工具: {kind}")),
-    };
-    Ok(list)
+    // 同步命令会跑在主线程：文件扫描 + 子进程（最长 5s）必须移出
+    tauri::async_runtime::spawn_blocking(move || {
+        let max_items = limit.unwrap_or(40).clamp(1, 100) as usize;
+        let filter = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let list = match kind.as_str() {
+            "codex" => list_codex_history_sessions(filter, max_items),
+            "kiro" => list_kiro_history_sessions(filter, max_items),
+            "mimo" => list_mimo_history_sessions(filter, max_items),
+            "claude" => list_claude_history_sessions(filter, max_items),
+            "grok" => list_grok_history_sessions(filter, max_items),
+            _ => return Err(format!("不支持列出历史会话的工具: {kind}")),
+        };
+        Ok(list)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------- 会话 ----------
 
 #[tauri::command]
-fn create_session(
+async fn create_session(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     id: String,
     kind: String,
     cols: u16,
     rows: u16,
     cwd: Option<String>,
-    // 可选：覆盖默认启动命令（用于 resume / 续聊）
+    // 可选：覆盖默认启动命令（用于 resume / 续聊 / 受限模式）
     launch_command: Option<String>,
+    // PTY 输出二进制通道：替代 pty://output 事件，避免 Vec<u8> 的 JSON 数组序列化开销
+    on_output: Channel<Response>,
 ) -> Result<(), String> {
-    // 校验工作目录
-    if let Some(ref dir) = cwd {
-        if !dir.trim().is_empty() && !Path::new(dir).is_dir() {
-            return Err(format!("工作目录不存在: {}", dir));
-        }
-    }
-
-    let cfg_snapshot = state.config.lock().clone();
-    let launch_override = launch_command
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty());
-    // 续聊会传 launch_command：即使关闭「自动启动 AI」也要注入 resume 命令
-    let should_auto_inject = cfg_snapshot.auto_launch || launch_override.is_some();
-
-    // 若需要自动注入 AI / 续聊命令，先检查 CLI 是否存在
-    if should_auto_inject && kind != "shell" {
-        let binary = if let Some(ref override_line) = launch_override {
-            override_line
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string()
-        } else {
-            cli_binary_for_kind(&kind, &cfg_snapshot.launch_args)
-        };
-        if !binary.is_empty() && which_command(&binary).is_none() {
-            return Err(format!(
-                "未找到命令「{}」。请安装对应 CLI 或在设置中修改启动命令，也可关闭「自动启动 AI」。",
-                binary
-            ));
-        }
-    }
-
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| e.to_string())?;
-
-    let (shell, shell_args) = shell_command();
-    let mut cmd = CommandBuilder::new(&shell);
-    for arg in shell_args {
-        cmd.arg(arg);
-    }
-
-    let work_dir = cwd
-        .filter(|d| !d.trim().is_empty())
-        .or_else(user_home_dir);
-    if let Some(ref dir) = work_dir {
-        cmd.cwd(dir);
-    }
-
-    // 与 macOS Terminal / iTerm 对齐的终端环境：真彩、UTF-8、CLI 颜色
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "AITerminal");
-    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-    // 优先沿用系统语言环境，保证中文与 UTF-8 正常
-    let locale = std::env::var("LC_ALL")
-        .or_else(|_| std::env::var("LANG"))
-        .unwrap_or_else(|_| "zh_CN.UTF-8".into());
-    cmd.env("LANG", &locale);
-    cmd.env("LC_ALL", &locale);
-    cmd.env("LC_CTYPE", &locale);
-    // 常见 CLI 彩色输出开关（ls / git / 多数 TUI）
-    cmd.env("CLICOLOR", "1");
-    cmd.env("CLICOLOR_FORCE", "1");
-    cmd.env("FORCE_COLOR", "1");
-    // 把当前进程 PATH（已 enrich）传给子 shell
-    if let Ok(path) = std::env::var("PATH") {
-        cmd.env("PATH", path);
-    }
-    // 继承常用环境，避免 shell 配置依赖缺失
-    for key in [
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "TMPDIR",
-        "SHELL",
-        "SSH_AUTH_SOCK",
-        "XPC_FLAGS",
-        "XPC_SERVICE_NAME",
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            cmd.env(key, value);
-        }
-    }
-
-    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-
-    let app_for_reader = app.clone();
-    let id_for_reader = id.clone();
-    thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let chunk = buf[..n].to_vec();
-                    let _ = app_for_reader.emit(&format!("pty://output/{id_for_reader}"), chunk);
-                }
-                Err(_) => break,
+    let sessions = Arc::clone(&state.sessions);
+    let config = Arc::clone(&state.config);
+    tauri::async_runtime::spawn_blocking(move || {
+        // 校验工作目录
+        if let Some(ref dir) = cwd {
+            if !dir.trim().is_empty() && !Path::new(dir).is_dir() {
+                return Err(format!("工作目录不存在: {}", dir));
             }
         }
-        let _ = app_for_reader.emit(&format!("pty://exit/{id_for_reader}"), ());
-    });
 
-    state.sessions.lock().insert(
-        id.clone(),
-        PtySession {
-            master: pair.master,
-            writer,
-            child,
-        },
-    );
+        let cfg_snapshot = config.lock().clone();
+        let launch_override = launch_command
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty());
+        // 续聊会传 launch_command：即使关闭「自动启动 AI」也要注入 resume 命令
+        let should_auto_inject = cfg_snapshot.auto_launch || launch_override.is_some();
 
-    // 延迟注入 AI CLI / 续聊命令，等待 login shell 就绪
-    if should_auto_inject {
-        let launch_line = if let Some(override_line) = launch_override {
-            Some(override_line)
-        } else {
-            match kind.as_str() {
-                "kiro" => Some(cfg_snapshot.launch_args.kiro.clone()),
-                "codex" => Some(cfg_snapshot.launch_args.codex.clone()),
-                "claude" => Some(cfg_snapshot.launch_args.claude.clone()),
-                "mimo" => Some(cfg_snapshot.launch_args.mimo.clone()),
-                "shell" => None,
-                _ => None,
-            }
-        };
-        if let Some(line) = launch_line {
-            let delay = cfg_snapshot.launch_delay_ms;
-            let sessions = Arc::clone(&state.sessions);
-            let sid = id.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(delay));
-                if let Some(sess) = sessions.lock().get_mut(&sid) {
-                    let payload = format!("{}\r", line.trim());
-                    let _ = sess.writer.write_all(payload.as_bytes());
-                    let _ = sess.writer.flush();
-                }
-            });
-        }
-    }
-
-    // 使用过的目录记入最近
-    if let Some(dir) = work_dir {
-        if Path::new(&dir).is_dir() {
-            let snapshot = {
-                let mut cfg = state.config.lock();
-                push_recent(&mut cfg, &dir);
-                cfg.clone()
+        // 若需要自动注入 AI / 续聊命令，先检查 CLI 是否存在
+        if should_auto_inject && kind != "shell" {
+            let binary = if let Some(ref override_line) = launch_override {
+                override_line
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                cli_binary_for_kind(&kind, &cfg_snapshot.launch_args)
             };
-            let _ = save_config(&app, &snapshot);
+            if !binary.is_empty() && which_command(&binary).is_none() {
+                return Err(format!(
+                    "未找到命令「{}」。请安装对应 CLI 或在设置中修改启动命令，也可关闭「自动启动 AI」。",
+                    binary
+                ));
+            }
         }
-    }
 
-    Ok(())
-}
-
-#[tauri::command]
-fn write_session(state: State<AppState>, id: String, data: String) -> Result<(), String> {
-    let mut map = state.sessions.lock();
-    let sess = map.get_mut(&id).ok_or("会话不存在")?;
-    sess.writer
-        .write_all(data.as_bytes())
-        .map_err(|e| e.to_string())?;
-    sess.writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-fn resize_session(state: State<AppState>, id: String, cols: u16, rows: u16) -> Result<(), String> {
-    let map = state.sessions.lock();
-    if let Some(sess) = map.get(&id) {
-        sess.master
-            .resize(PtySize {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
                 rows: rows.max(1),
                 cols: cols.max(1),
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+
+        let (shell, shell_args) = shell_command();
+        let mut cmd = CommandBuilder::new(&shell);
+        for arg in shell_args {
+            cmd.arg(arg);
+        }
+
+        let work_dir = cwd
+            .filter(|d| !d.trim().is_empty())
+            .or_else(user_home_dir);
+        if let Some(ref dir) = work_dir {
+            cmd.cwd(dir);
+        }
+
+        // 与 macOS Terminal / iTerm 对齐的终端环境：真彩、UTF-8、CLI 颜色
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "AITerminal");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        // 优先沿用系统语言环境，保证中文与 UTF-8 正常
+        let locale = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_else(|_| "zh_CN.UTF-8".into());
+        cmd.env("LANG", &locale);
+        cmd.env("LC_ALL", &locale);
+        cmd.env("LC_CTYPE", &locale);
+        // 常见 CLI 彩色输出开关（ls / git / 多数 TUI）
+        cmd.env("CLICOLOR", "1");
+        cmd.env("CLICOLOR_FORCE", "1");
+        cmd.env("FORCE_COLOR", "1");
+        // 把当前进程 PATH（已 enrich）传给子 shell
+        if let Ok(path) = std::env::var("PATH") {
+            cmd.env("PATH", path);
+        }
+        // 继承常用环境，避免 shell 配置依赖缺失
+        for key in [
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "TMPDIR",
+            "SHELL",
+            "SSH_AUTH_SOCK",
+            "XPC_FLAGS",
+            "XPC_SERVICE_NAME",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
+        }
+
+        let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+        let writer = Arc::new(Mutex::new(writer));
+
+        let app_for_reader = app.clone();
+        let id_for_reader = id.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = buf[..n].to_vec();
+                        // 字节直通：前端收到 ArrayBuffer，无 JSON 序列化
+                        if on_output.send(Response::new(chunk)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = app_for_reader.emit(&format!("pty://exit/{id_for_reader}"), ());
+        });
+
+        sessions.lock().insert(
+            id.clone(),
+            PtySession {
+                master: pair.master,
+                writer: Arc::clone(&writer),
+                child,
+            },
+        );
+
+        // 延迟注入 AI CLI / 续聊命令，等待 login shell 就绪
+        if should_auto_inject {
+            let launch_line = if let Some(override_line) = launch_override {
+                Some(override_line)
+            } else {
+                match kind.as_str() {
+                    "kiro" => Some(cfg_snapshot.launch_args.kiro.clone()),
+                    "codex" => Some(cfg_snapshot.launch_args.codex.clone()),
+                    "claude" => Some(cfg_snapshot.launch_args.claude.clone()),
+                    "mimo" => Some(cfg_snapshot.launch_args.mimo.clone()),
+                    "grok" => Some(cfg_snapshot.launch_args.grok.clone()),
+                    "shell" => None,
+                    _ => None,
+                }
+            };
+            if let Some(line) = launch_line {
+                let delay = cfg_snapshot.launch_delay_ms;
+                let sessions = Arc::clone(&sessions);
+                let sid = id.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(delay));
+                    // 只在锁内取 writer 句柄，写入移出全局会话锁
+                    let writer = sessions
+                        .lock()
+                        .get(&sid)
+                        .map(|sess| Arc::clone(&sess.writer));
+                    if let Some(writer) = writer {
+                        let mut w = writer.lock();
+                        let payload = format!("{}\r", line.trim());
+                        let _ = w.write_all(payload.as_bytes());
+                        let _ = w.flush();
+                    }
+                });
+            }
+        }
+
+        // 使用过的目录记入最近
+        if let Some(dir) = work_dir {
+            if Path::new(&dir).is_dir() {
+                let mut cfg = config.lock();
+                push_recent(&mut cfg, &dir);
+                let snapshot = cfg.clone();
+                let _ = save_config(&app, &snapshot);
+            }
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn close_session(state: State<AppState>, id: String) -> Result<(), String> {
-    if let Some(mut sess) = state.sessions.lock().remove(&id) {
-        let _ = sess.child.kill();
-    }
-    Ok(())
+async fn write_session(state: State<'_, AppState>, id: String, data: String) -> Result<(), String> {
+    // 只在锁内取 writer 句柄；PTY 缓冲满时的阻塞写不再冻结全局会话表与主线程
+    let writer = {
+        let map = state.sessions.lock();
+        let sess = map.get(&id).ok_or("会话不存在")?;
+        Arc::clone(&sess.writer)
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut w = writer.lock();
+        w.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+        w.flush().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn close_all_sessions(state: State<AppState>) -> Result<(), String> {
-    kill_all_sessions(&state);
-    Ok(())
+async fn resize_session(state: State<'_, AppState>, id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let sessions = Arc::clone(&state.sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        let map = sessions.lock();
+        if let Some(sess) = map.get(&id) {
+            sess.master
+                .resize(PtySize {
+                    rows: rows.max(1),
+                    cols: cols.max(1),
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn close_session(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let sessions = Arc::clone(&state.sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        // kill + wait 均为阻塞调用，移出主线程；wait 回收避免僵尸进程
+        if let Some(mut sess) = sessions.lock().remove(&id) {
+            let _ = sess.child.kill();
+            let _ = sess.child.wait();
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn close_all_sessions(state: State<'_, AppState>) -> Result<(), String> {
+    let sessions = Arc::clone(&state.sessions);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut drained: Vec<PtySession> = {
+            let mut map = sessions.lock();
+            map.drain().map(|(_, sess)| sess).collect()
+        };
+        for sess in drained.iter_mut() {
+            let _ = sess.child.kill();
+        }
+        for sess in drained.iter_mut() {
+            let _ = sess.child.wait();
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------- AI 配置 ----------
@@ -1277,9 +1637,15 @@ struct AiToolConfig {
 }
 
 #[tauri::command]
-fn read_ai_config(tool: String) -> Result<AiToolConfig, String> {
+async fn read_ai_config(tool: String) -> Result<AiToolConfig, String> {
+    tauri::async_runtime::spawn_blocking(move || read_ai_config_blocking(&tool))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn read_ai_config_blocking(tool: &str) -> Result<AiToolConfig, String> {
     let home = user_home_dir().ok_or("无法获取用户主目录")?;
-    match tool.as_str() {
+    match tool {
         "codex" => {
             let config_path = format!("{}/.codex/config.toml", home);
             let auth_path = format!("{}/.codex/auth.json", home);
@@ -1287,20 +1653,17 @@ fn read_ai_config(tool: String) -> Result<AiToolConfig, String> {
             let auth_text = std::fs::read_to_string(&auth_path).unwrap_or_default();
             let mut model = String::new();
             let mut base_url = String::new();
-            let mut in_custom = false;
-            for line in config_text.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with('[') {
-                    in_custom = trimmed == "[model_providers.custom]";
-                    continue;
+            if let Ok(doc) = config_text.parse::<toml_edit::DocumentMut>() {
+                if let Some(v) = doc.get("model").and_then(|v| v.as_str()) {
+                    model = v.to_string();
                 }
-                if let Some(v) = trimmed.strip_prefix("model = ") {
-                    if !in_custom {
-                        model = v.trim_matches('"').to_string();
-                    }
-                }
-                if let Some(v) = trimmed.strip_prefix("base_url = ") {
-                    base_url = v.trim_matches('"').to_string();
+                if let Some(v) = doc
+                    .get("model_providers")
+                    .and_then(|p| p.get("custom"))
+                    .and_then(|c| c.get("base_url"))
+                    .and_then(|v| v.as_str())
+                {
+                    base_url = v.to_string();
                 }
             }
             let mut api_key = String::new();
@@ -1370,11 +1733,67 @@ fn read_ai_config(tool: String) -> Result<AiToolConfig, String> {
             let mimo_config_path = format!("{}/.mimocode/config.toml", home);
             let mut model = String::new();
             if let Ok(cfg_text) = std::fs::read_to_string(&mimo_config_path) {
-                for line in cfg_text.lines() {
-                    let trimmed = line.trim();
-                    if let Some(v) = trimmed.strip_prefix("model = ") {
-                        model = v.trim_matches('"').to_string();
+                if let Ok(doc) = cfg_text.parse::<toml_edit::DocumentMut>() {
+                    if let Some(v) = doc.get("model").and_then(|v| v.as_str()) {
+                        model = v.to_string();
                     }
+                }
+            }
+            Ok(AiToolConfig {
+                base_url,
+                api_key,
+                model,
+            })
+        }
+        "grok" => {
+            // ~/.grok/config.toml：顶层 [models] default、[endpoints] models_base_url、
+            // 以及 [model.<id>] 段内的 base_url / api_key
+            let config_path = format!("{}/.grok/config.toml", home);
+            let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+            let doc = config_text.parse::<toml_edit::DocumentMut>().ok();
+            let model = doc
+                .as_ref()
+                .and_then(|d| d.get("models"))
+                .and_then(|t| t.get("default"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let mut base_url = doc
+                .as_ref()
+                .and_then(|d| d.get("endpoints"))
+                .and_then(|t| t.get("models_base_url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let mut api_key = String::new();
+            // [model.<id>] 段：优先 default 模型对应 section，否则取第一个含该 key 的
+            if let Some(model_tbl) = doc
+                .as_ref()
+                .and_then(|d| d.get("model"))
+                .and_then(|t| t.as_table_like())
+            {
+                // 模型 id 可能含点号（如 grok-4.5），TOML 会解析成多级嵌套，需递归收集
+                let mut sections: Vec<(String, &dyn toml_edit::TableLike)> = Vec::new();
+                collect_model_sections(model_tbl, "", &mut sections);
+                let pick = |key: &str| -> Option<String> {
+                    let mut fallback: Option<String> = None;
+                    for (name, sub) in &sections {
+                        if let Some(v) = sub.get(key).and_then(|v| v.as_str()) {
+                            if !model.is_empty() && name == &model {
+                                return Some(v.to_string());
+                            }
+                            if fallback.is_none() {
+                                fallback = Some(v.to_string());
+                            }
+                        }
+                    }
+                    fallback
+                };
+                if let Some(v) = pick("base_url") {
+                    base_url = v;
+                }
+                if let Some(v) = pick("api_key") {
+                    api_key = v;
                 }
             }
             Ok(AiToolConfig {
@@ -1404,22 +1823,28 @@ fn merge_json_file(path: &str, mutator: impl FnOnce(&mut serde_json::Value)) -> 
 }
 
 #[tauri::command]
-fn write_ai_config(tool: String, config: AiToolConfig) -> Result<(), String> {
+async fn write_ai_config(tool: String, config: AiToolConfig) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_ai_config_blocking(&tool, &config))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn write_ai_config_blocking(tool: &str, config: &AiToolConfig) -> Result<(), String> {
     let home = user_home_dir().ok_or("无法获取用户主目录")?;
-    match tool.as_str() {
+    match tool {
         "codex" => {
             let config_path = format!("{}/.codex/config.toml", home);
             let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
             if !config.model.is_empty() {
-                content = update_toml_value(&content, "model", &config.model);
+                content = toml_set_key(&content, None, "model", &config.model)?;
             }
             if !config.base_url.is_empty() {
-                content = update_toml_section_value(
+                content = toml_set_key(
                     &content,
-                    "model_providers.custom",
+                    Some("model_providers.custom"),
                     "base_url",
                     &config.base_url,
-                );
+                )?;
             }
             if let Some(parent) = Path::new(&config_path).parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1500,17 +1925,59 @@ fn write_ai_config(tool: String, config: AiToolConfig) -> Result<(), String> {
             })?;
             if !config.model.is_empty() {
                 let mimo_config_path = format!("{}/.mimocode/config.toml", home);
-                let mut content = std::fs::read_to_string(&mimo_config_path).unwrap_or_default();
-                if content.contains("model = ") {
-                    content = update_toml_value(&content, "model", &config.model);
-                } else {
-                    content = format!("model = \"{}\"\n{}", config.model, content);
-                }
+                let content = std::fs::read_to_string(&mimo_config_path).unwrap_or_default();
+                let content = toml_set_key(&content, None, "model", &config.model)?;
                 if let Some(parent) = Path::new(&mimo_config_path).parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
                 atomic_write(Path::new(&mimo_config_path), &content)?;
             }
+        }
+        "grok" => {
+            let config_path = format!("{}/.grok/config.toml", home);
+            let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
+            if !config.model.is_empty() {
+                content = toml_set_key(&content, Some("models"), "default", &config.model)?;
+            }
+            if !config.base_url.is_empty() {
+                content = toml_set_key(
+                    &content,
+                    Some("endpoints"),
+                    "models_base_url",
+                    &config.base_url,
+                )?;
+            }
+            // 写入 / 更新 [model.<id>] 段，保证该模型有 base_url / api_key
+            let model_id = if config.model.is_empty() {
+                // 从现有配置读 default
+                content
+                    .parse::<toml_edit::DocumentMut>()
+                    .ok()
+                    .and_then(|d| {
+                        d.get("models")
+                            .and_then(|t| t.get("default"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "grok-4.5".into())
+            } else {
+                config.model.clone()
+            };
+            let section = format!("model.{}", model_id);
+            if !config.base_url.is_empty() {
+                content =
+                    toml_set_key(&content, Some(&section), "base_url", &config.base_url)?;
+                // 同步 model 字段，便于 CLI 识别
+                content = toml_set_key(&content, Some(&section), "model", &model_id)?;
+            }
+            if !config.api_key.is_empty() {
+                content = toml_set_key(&content, Some(&section), "api_key", &config.api_key)?;
+            }
+            if let Some(parent) = Path::new(&config_path).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            atomic_write(Path::new(&config_path), &content)?;
         }
         _ => return Err(format!("未知工具类型: {}", tool)),
     }
@@ -1527,7 +1994,18 @@ struct ConnectivityResult {
 }
 
 #[tauri::command]
-fn test_connectivity(base_url: String) -> ConnectivityResult {
+async fn test_connectivity(base_url: String) -> ConnectivityResult {
+    // curl 最长 10s，不能留在主线程
+    tauri::async_runtime::spawn_blocking(move || test_connectivity_blocking(&base_url))
+        .await
+        .unwrap_or_else(|_| ConnectivityResult {
+            ok: false,
+            status: None,
+            message: "内部错误".into(),
+        })
+}
+
+fn test_connectivity_blocking(base_url: &str) -> ConnectivityResult {
     let url = base_url.trim().trim_end_matches('/').to_string();
     if url.is_empty() {
         return ConnectivityResult {
@@ -1604,7 +2082,13 @@ fn test_connectivity(base_url: String) -> ConnectivityResult {
 
 /// 读取目录所在 git 仓库的当前分支名；非仓库返回 null
 #[tauri::command]
-fn get_git_branch(path: Option<String>) -> Option<String> {
+async fn get_git_branch(path: Option<String>) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || get_git_branch_blocking(path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn get_git_branch_blocking(path: Option<String>) -> Option<String> {
     let dir = path
         .filter(|value| !value.trim().is_empty())
         .or_else(user_home_dir)?;
@@ -1641,7 +2125,13 @@ fn get_git_branch(path: Option<String>) -> Option<String> {
 }
 
 #[tauri::command]
-fn reveal_in_finder(path: String) -> Result<(), String> {
+async fn reveal_in_finder(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || reveal_in_finder_blocking(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn reveal_in_finder_blocking(path: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         Command::new("open")
@@ -1655,7 +2145,7 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
         let parent = Path::new(&path)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or(path.clone());
+            .unwrap_or_else(|| path.to_string());
         Command::new("xdg-open")
             .arg(parent)
             .spawn()
@@ -1672,71 +2162,54 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
     }
 }
 
-fn update_toml_value(content: &str, key: &str, value: &str) -> String {
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    let mut found = false;
-    let mut in_section = false;
-    for line in &mut lines {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_section = true;
+/// 递归收集 [model.*] 下的叶子模型段：叶子 = 含 base_url/api_key 的表，
+/// 全名用点号拼接（兼容 `[model."a.b"]` 与 `[model.a.b]` 两种写法）。
+fn collect_model_sections<'a>(
+    tbl: &'a dyn toml_edit::TableLike,
+    prefix: &str,
+    out: &mut Vec<(String, &'a dyn toml_edit::TableLike)>,
+) {
+    for (name, item) in tbl.iter() {
+        let Some(sub) = item.as_table_like() else {
             continue;
+        };
+        let full = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", prefix, name)
+        };
+        if sub.get("api_key").is_some() || sub.get("base_url").is_some() {
+            out.push((full, sub));
+        } else {
+            collect_model_sections(sub, &full, out);
         }
-        // 只改顶层 key（进入任意 section 前）
-        if !in_section && trimmed.starts_with(&format!("{} = ", key)) {
-            *line = format!("{} = \"{}\"", key, value);
-            found = true;
-            break;
-        }
     }
-    if !found {
-        lines.insert(0, format!("{} = \"{}\"", key, value));
-    }
-    let mut out = lines.join("\n");
-    if content.ends_with('\n') && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
 }
 
-fn update_toml_section_value(content: &str, section: &str, key: &str, value: &str) -> String {
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    let section_header = format!("[{}]", section);
-    let mut in_section = false;
-    let mut found = false;
-    let mut section_pos: Option<usize> = None;
-    for (idx, line) in lines.iter_mut().enumerate() {
-        let trimmed = line.trim();
-        if trimmed == section_header {
-            in_section = true;
-            section_pos = Some(idx);
-            continue;
-        }
-        if in_section && trimmed.starts_with('[') {
-            break;
-        }
-        if in_section && trimmed.starts_with(&format!("{} = ", key)) {
-            *line = format!("{} = \"{}\"", key, value);
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        if let Some(pos) = section_pos {
-            lines.insert(pos + 1, format!("{} = \"{}\"", key, value));
-        } else {
-            if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(true) {
-                lines.push(String::new());
-            }
-            lines.push(section_header);
-            lines.push(format!("{} = \"{}\"", key, value));
+/// 用 toml_edit 做结构化合并：容忍任意空格/引号写法，自动转义值，保留注释与其它字段。
+/// section 为点分层级（如 "model_providers.custom"），None 表示顶层 key。
+fn toml_set_key(
+    content: &str,
+    section: Option<&str>,
+    key: &str,
+    value: &str,
+) -> Result<String, String> {
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("TOML 解析失败（为避免覆盖损坏的配置，未写入）: {}", e))?;
+    let mut table = doc.as_table_mut();
+    if let Some(section) = section {
+        for part in section.split('.') {
+            let entry = table
+                .entry(part)
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+            table = entry
+                .as_table_mut()
+                .ok_or_else(|| format!("TOML 路径 {} 与非表节点冲突", section))?;
         }
     }
-    let mut out = lines.join("\n");
-    if content.ends_with('\n') && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+    table[key] = toml_edit::value(value);
+    Ok(doc.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

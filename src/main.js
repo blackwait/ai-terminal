@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
@@ -125,7 +125,17 @@ const KIND_LABEL = {
   codex: "Codex",
   claude: "Claude",
   mimo: "MiMo",
+  grok: "Grok",
   shell: "Shell",
+};
+
+/** 受限模式：仅启动二进制本体，不带 bypass/trust 等高权限参数 */
+const RESTRICTED_LAUNCH = {
+  kiro: "kiro-cli",
+  codex: "codex",
+  claude: "claude",
+  mimo: "mimo",
+  grok: "grok",
 };
 
 /** 终端字体：等宽 + 科技感 */
@@ -518,11 +528,38 @@ function activityStateLabel(state) {
  * @param {"idle"|"running"|"done"} nextState
  * @param {{ notify?: boolean }} [options]
  */
+function sessionTooltip(session) {
+  const titleBase = session.displayTitle || session.defaultName || "";
+  const idTag = session.cliSessionId
+    ? ` · #${session.cliSessionId.slice(0, 8)}`
+    : "";
+  if (session.exited) return `${titleBase}${idTag} · 已退出`;
+  const activity = session.activityState || SESSION_ACTIVITY.idle;
+  return `${titleBase}${idTag} · ${activityStateLabel(activity)}`;
+}
+
 function applySessionActivityState(session, nextState, options = {}) {
   if (!session || !session.tab) return;
   const previousState = session.activityState || SESSION_ACTIVITY.idle;
   const state = nextState || SESSION_ACTIVITY.idle;
   session.activityState = state;
+
+  // 「已完成未读」角标：进入 done 且当前未在查看时点亮
+  if (state === SESSION_ACTIVITY.done) {
+    session.unreadDone = !(session.id === activeId && document.hasFocus());
+  } else {
+    session.unreadDone = false;
+  }
+  if (session.badgeEl && session.badgeEl.hidden !== !session.unreadDone) {
+    session.badgeEl.hidden = !session.unreadDone;
+  }
+
+  // 状态未变化时跳过 DOM 写入：高频输出下每个 chunk 都改 classList 是性能热点
+  const exitedChanged = session._exitedApplied !== session.exited;
+  if (state === previousState && !exitedChanged && !options.notify) {
+    return;
+  }
+  session._exitedApplied = session.exited;
 
   session.tab.classList.remove(
     "state-idle",
@@ -534,12 +571,7 @@ function applySessionActivityState(session, nextState, options = {}) {
     session.tab.classList.add(`state-${state}`);
   }
 
-  const titleBase = session.displayTitle || session.defaultName || "";
-  if (session.exited) {
-    session.tab.title = `${titleBase} · 已退出`;
-  } else {
-    session.tab.title = `${titleBase} · ${activityStateLabel(state)}`;
-  }
+  session.tab.title = sessionTooltip(session);
 
   if (
     options.notify &&
@@ -568,12 +600,26 @@ function markSessionOutput(session, byteLength = 0) {
   }
   session.doneNotified = false;
   applySessionActivityState(session, SESSION_ACTIVITY.running);
+  armSessionIdleCheck(session);
+}
 
-  clearSessionActivityTimer(session.id);
+/**
+ * 静默完成检查：定时器只武装一次（非每 chunk 重建），
+ * 触发时若静默不足则按剩余时间顺延，保证「最后一次输出后 4.5s」判定不变。
+ */
+function armSessionIdleCheck(session, delay = TASK_DONE_IDLE_MS) {
+  if (!session || session.exited) return;
+  if (activityIdleTimers.has(session.id)) return;
   const timer = setTimeout(() => {
     activityIdleTimers.delete(session.id);
     if (!sessions.has(session.id) || session.exited) return;
     if (session.activityState !== SESSION_ACTIVITY.running) return;
+
+    const idleFor = Date.now() - (session.lastActivityAt || 0);
+    if (idleFor < TASK_DONE_IDLE_MS) {
+      armSessionIdleCheck(session, TASK_DONE_IDLE_MS - idleFor);
+      return;
+    }
 
     const enoughOutput =
       (session.outputByteCount || 0) >= MIN_OUTPUT_BYTES_FOR_DONE;
@@ -588,7 +634,7 @@ function markSessionOutput(session, byteLength = 0) {
       session.outputByteCount = 0;
       applySessionActivityState(session, SESSION_ACTIVITY.idle);
     }
-  }, TASK_DONE_IDLE_MS);
+  }, delay);
   activityIdleTimers.set(session.id, timer);
 }
 
@@ -912,7 +958,11 @@ function applyConfig(cfg) {
     session.term.options.fontSize = fontSize;
     session.term.options.fontFamily = TERM_FONT_FAMILY;
     session.term.options.theme = getTermTheme();
-    fit(session);
+  }
+  // 仅可见会话需要 refit + resize IPC；隐藏会话在 activate 时自会 fit
+  for (const visibleId of [activeId, splitId]) {
+    const visible = visibleId ? sessions.get(visibleId) : null;
+    if (visible) fit(visible);
   }
 }
 
@@ -1106,10 +1156,21 @@ async function pasteIntoSession(session) {
   if (!session || session.exited) return;
   try {
     const text = await navigator.clipboard.readText();
-    if (text) {
-      noteUserSessionInput(session, text);
-      await invoke("write_session", { id: session.id, data: text });
+    if (!text) return;
+    let payload = text;
+    if (/[\r\n]/.test(text)) {
+      // 多行粘贴会逐行执行（粘贴来的脚本可能含 rm/sudo 等），先确认
+      const lines = text.split(/\r\n|\r|\n/).length;
+      const firstLine = text.split(/\r\n|\r|\n/).find((l) => l.trim()) || "";
+      const ok = await askConfirm(
+        `粘贴内容共 ${lines} 行（首行：${firstLine.slice(0, 48)}），多行会逐行发送到终端执行，确认粘贴？`
+      );
+      if (!ok) return;
+      // bracketed paste：让 shell/CLI 识别为一次粘贴而非逐行输入
+      payload = `\x1b[200~${text}\x1b[201~`;
     }
+    noteUserSessionInput(session, text);
+    await invoke("write_session", { id: session.id, data: payload });
   } catch (err) {
     console.error("粘贴失败:", err);
   }
@@ -1142,6 +1203,16 @@ function attachTerminalInteractions(session) {
     const selected = term.getSelection();
     if (selected && selected.length > 0) {
       copyTextToClipboard(selected);
+    }
+  });
+
+  // 点击终端区域时抢回焦点（避免焦点落在 body/侧栏后必须 Tab 才能输入）
+  pane.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    if (session.id !== activeId && session.id !== splitId) {
+      activate(session.id);
+    } else {
+      ensureTerminalFocus(session);
     }
   });
 
@@ -1295,9 +1366,11 @@ function syncImeTextarea(session) {
 }
 
 /**
- * 中文输入法英文态下，仅少数标点（尤其 ?）会因 keyCode=229 丢失。
+ * 中文输入法英文/大写态下，标点（尤其 ?）在 WebView + xterm 中常丢失：
+ * - keyCode=229 时 CompositionHelper 走 textarea diff，但 WebView 不改 textarea
+ * - 或 key 为 Process / Unidentified，evaluateKeyboardEvent 得不到字符
+ * 注意：即使 event.key 已是 "?"，keyCode 仍可能是 229，不能因为 key 明确就跳过兜底。
  * 切勿对 a-z 等普通字符强制写入：会与 xterm 正常路径双发，表现为「字间空格/重字」。
- * 策略：只拦截「需要兜底的标点」；普通字母完全交给 xterm。
  */
 const IME_PUNCTUATION_CODE_MAP = {
   Slash: ["/", "?"],
@@ -1323,11 +1396,21 @@ const IME_PUNCTUATION_CODE_MAP = {
   Digit0: ["0", ")"],
 };
 
+const IME_PUNCTUATION_CHARS = "?/!@#$%^&*()_+-=[]{}\\|;:'\",.<>`~";
+
 function isAsciiLetterOrDigitKey(event) {
   const key = event?.key || "";
+  // 仅当 key 本身就是字母数字时才跳过；Process/Unidentified 时 code 可能是 KeyA，
+  // 不能据此跳过（否则 IME 英文态字母/数字也有可能丢，但字母通常走 input 路径）。
   if (key.length === 1 && /[A-Za-z0-9]/.test(key)) return true;
-  const code = event?.code || "";
-  return /^Key[A-Z]$/.test(code) || /^Digit[0-9]$/.test(code);
+  return false;
+}
+
+function isImeLikeKeyEvent(event) {
+  if (!event) return false;
+  const key = event.key || "";
+  const keyCode = event.keyCode || event.which || 0;
+  return keyCode === 229 || key === "Process" || key === "Unidentified" || !key;
 }
 
 function resolveImePunctuationCharacter(event) {
@@ -1339,12 +1422,11 @@ function resolveImePunctuationCharacter(event) {
   const pair = IME_PUNCTUATION_CODE_MAP[code];
   if (pair) return shifted ? pair[1] : pair[0];
   const keyCode = event.keyCode || event.which || 0;
+  // Slash 在部分布局 keyCode 为 191；229 时不能用 keyCode 还原
   if (keyCode === 191) return shifted ? "?" : "/";
-  // 仅当 key 本身就是我们关心的标点时才采用（避免把字母当兜底）
   const key = event.key;
-  if (key && key.length === 1 && !/[A-Za-z0-9\s]/.test(key)) {
-    // 常见易丢标点
-    if ("?/!@#$%^&*()_+-=[]{}\\|;:'\",.<>`~".includes(key)) return key;
+  if (key && key.length === 1 && IME_PUNCTUATION_CHARS.includes(key)) {
+    return key;
   }
   return null;
 }
@@ -1355,31 +1437,46 @@ function shouldForceImePunctuation(event) {
   if (event.isComposing) return false;
   // 字母数字绝不强制，防止双发
   if (isAsciiLetterOrDigitKey(event)) return false;
+
+  const character = resolveImePunctuationCharacter(event);
+  if (!character) return false;
+
+  const key = event.key || "";
   const keyCode = event.keyCode || event.which || 0;
-  const imeLike =
-    keyCode === 229 ||
-    event.key === "Process" ||
-    event.key === "Unidentified";
   const isSlash =
     event.code === "Slash" || keyCode === 191 || event.which === 191;
   const isMappedPunctuation = Boolean(IME_PUNCTUATION_CODE_MAP[event.code || ""]);
-  // 仅 IME 异常态 + 标点键，或 Slash 在 Unidentified 时
-  if (imeLike && (isMappedPunctuation || isSlash)) return true;
-  if (isSlash && (!event.key || event.key.length !== 1)) return true;
+  const imeLike = isImeLikeKeyEvent(event);
+
+  // IME 异常态 + 标点（含 key 已是 "?" 但 keyCode=229 的情况）
+  if (imeLike && (isMappedPunctuation || isSlash || IME_PUNCTUATION_CHARS.includes(key))) {
+    return true;
+  }
+  // Slash 无有效 key 时强制（少数 WebView 不报 229）
+  if (isSlash && (!key || key.length !== 1 || key === "Process" || key === "Unidentified")) {
+    return true;
+  }
   return false;
 }
 
-function writeForcedSessionCharacter(session, character) {
+function writeForcedSessionCharacter(session, character, sourceEvent = null) {
   if (!session || session.exited || !character) return false;
-  const now = Date.now();
-  if (
-    session._lastForcedChar === character &&
-    now - (session._lastForcedAt || 0) < 40
-  ) {
-    return false;
+  // 同一 keydown 事件可能同时命中 customKeyHandler 与 capture：按事件对象去重，
+  // 不用同字符时间窗（快速连按同一标点如 "??" 会被误吞）
+  if (sourceEvent) {
+    if (session._lastForcedEvent === sourceEvent) return false;
+    session._lastForcedEvent = sourceEvent;
+  } else {
+    const now = Date.now();
+    if (
+      session._lastForcedChar === character &&
+      now - (session._lastForcedAt || 0) < 40
+    ) {
+      return false;
+    }
+    session._lastForcedChar = character;
+    session._lastForcedAt = now;
   }
-  session._lastForcedChar = character;
-  session._lastForcedAt = now;
   const textarea = session.term?.textarea;
   try {
     if (textarea) textarea.value = "";
@@ -1401,7 +1498,7 @@ function attachImePunctuationFix(session) {
     if (!shouldForceImePunctuation(event)) return false;
     const character = resolveImePunctuationCharacter(event);
     if (!character) return false;
-    writeForcedSessionCharacter(session, character);
+    writeForcedSessionCharacter(session, character, event);
     return true;
   };
 
@@ -1412,9 +1509,11 @@ function attachImePunctuationFix(session) {
     event.stopImmediatePropagation?.();
   };
 
+  // 捕获阶段先于 xterm CompositionHelper，避免 229 被吞掉后无字符
   textarea.addEventListener("keydown", onKeyDownCapture, true);
   session.imePunctuationHandler = onKeyDownCapture;
 
+  // xterm 内部 keydown 也会走 custom handler；返回 false 阻止其默认处理（防双发）
   try {
     term.attachCustomKeyEventHandler((event) => {
       if (handleForcedPunctuation(event)) return false;
@@ -1425,16 +1524,42 @@ function attachImePunctuationFix(session) {
   }
 }
 
+/**
+ * 确保终端可接收键盘：点 pane / 输出后若焦点落在 body 上，按键会丢失；
+ * 用户常表现为「要按 Tab 才能继续输入」。
+ */
+function ensureTerminalFocus(session) {
+  if (!session || session.exited) return;
+  const textarea = session.term?.textarea;
+  if (!textarea) {
+    session.term?.focus();
+    return;
+  }
+  if (document.activeElement === textarea) return;
+  // 侧栏筛选、设置、搜索等编辑框持有焦点时不抢
+  if (isEditableTarget(document.activeElement)) return;
+  session.term.focus();
+}
+
 function attachImeTextareaSync(session) {
   const sync = () => syncImeTextarea(session);
+  // onRender 每帧触发且 sync 内含 getBoundingClientRect 强制布局 → 必须按帧合并
+  let pending = false;
+  const syncSoon = () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      sync();
+    });
+  };
   const textarea = session.term.textarea;
   const disposers = [
-    session.term.onCursorMove(sync),
-    session.term.onRender(sync),
-    session.term.onResize(sync),
+    session.term.onCursorMove(syncSoon),
+    session.term.onRender(syncSoon),
+    session.term.onResize(syncSoon),
   ];
   if (textarea) {
-    const syncSoon = () => requestAnimationFrame(sync);
     textarea.addEventListener("focus", sync);
     textarea.addEventListener("keydown", syncSoon, true);
     textarea.addEventListener("compositionstart", sync, true);
@@ -1467,12 +1592,7 @@ function setTitle(session, text) {
   const shown = text.length > max ? text.slice(0, max) + "…" : text;
   session.titleEl.textContent = shown;
   session.displayTitle = text;
-  if (session.exited) {
-    session.tab.title = `${text} · 已退出`;
-  } else {
-    const activity = session.activityState || SESSION_ACTIVITY.idle;
-    session.tab.title = `${text} · ${activityStateLabel(activity)}`;
-  }
+  session.tab.title = sessionTooltip(session);
   if (session.id === activeId) {
     document.title = `${shown} — AI Terminal`;
   }
@@ -1547,6 +1667,9 @@ function activate(id) {
   }
   const session = sessions.get(id);
   if (session) {
+    // 查看即清「已完成未读」角标
+    session.unreadDone = false;
+    if (session.badgeEl) session.badgeEl.hidden = true;
     requestAnimationFrame(() => {
       fit(session);
       if (splitId) {
@@ -1576,6 +1699,10 @@ async function persistSessionsSnapshot() {
           : session.resumeMode === "picker"
             ? "picker"
             : "last",
+      // 绑定过的 CLI 会话 ID 一并持久化，恢复时精确接回
+      cliSessionId: session.cliSessionId || null,
+      // 受限模式档位随快照持久化
+      restricted: session.restricted === true,
     }));
   try {
     const cfg = await invoke("update_prefs", { patch: { restoreSessions } });
@@ -1720,7 +1847,7 @@ async function loadResumeHistoryList() {
     const items = await invoke("list_ai_sessions", {
       kind: resumePickerKind,
       cwd: cwdArg,
-      limit: 50,
+      limit: 15,
     });
     resumeHistoryItems = Array.isArray(items) ? items : [];
     resumeHistoryLoading = false;
@@ -1753,6 +1880,7 @@ async function openHistorySession(kind, item) {
     title: `${KIND_LABEL[kind] || kind} · ${shortTitle}`,
     resumeMode: "last",
     launchCommand,
+    cliSessionId: item.id,
   });
 }
 
@@ -1780,12 +1908,13 @@ async function closeSession(id, options = {}) {
   if (!session) return;
   // 关闭会话直接终止，不弹确认（更接近原生终端关标签体验）
   void options;
+  // 标记为用户主动关闭：后端 kill 触发的 pty://exit 不应再弹「已退出」通知
+  session.closingManually = true;
   try {
     await invoke("close_session", { id });
   } catch (err) {
     console.error(err);
   }
-  session.unlistenOutput?.();
   session.unlistenExit?.();
   session.imeDisposers?.forEach((disposer) => disposer.dispose?.());
   session.scrollDisposer?.dispose?.();
@@ -2066,6 +2195,8 @@ function buildResumeLaunchCommand(kind, mode = "last", sessionId = null) {
         return `claude --resume ${explicitId}`;
       case "mimo":
         return `mimo --session ${explicitId} --trust --never-ask`;
+      case "grok":
+        return `grok --resume ${explicitId} --always-approve --permission-mode bypassPermissions`;
       default:
         return null;
     }
@@ -2086,6 +2217,11 @@ function buildResumeLaunchCommand(kind, mode = "last", sessionId = null) {
       return resumeMode === "picker"
         ? "mimo --trust --never-ask"
         : "mimo --continue --trust --never-ask";
+    case "grok":
+      // Grok：-c / --continue 最近；--resume 无 ID 时恢复最近；最高权限一并注入
+      return resumeMode === "picker"
+        ? "grok --resume --always-approve --permission-mode bypassPermissions"
+        : "grok --continue --always-approve --permission-mode bypassPermissions";
     default:
       return null;
   }
@@ -2106,14 +2242,24 @@ async function newSession(kind, options = {}) {
     options.resumeMode === "last" || options.resumeMode === "picker"
       ? options.resumeMode
       : null;
+  /** 绑定的 CLI 会话 ID：选会话续聊后记录，恢复/重启用它精确接回同一对话 */
+  const cliSessionId = options.cliSessionId || null;
+  /** 受限模式：注入不带 bypass/trust 参数的裸命令 */
+  const restricted = !!options.restricted && kind !== "shell";
   const launchCommand =
     options.launchCommand ||
+    (restricted ? RESTRICTED_LAUNCH[kind] || null : null) ||
+    (cliSessionId
+      ? buildResumeLaunchCommand(kind, "last", cliSessionId)
+      : null) ||
     (resumeMode ? buildResumeLaunchCommand(kind, resumeMode) : null);
   const defaultName =
     options.title ||
-    (resumeMode
-      ? `${defaultSessionTitle(kind, cwd)} · 续聊`
-      : defaultSessionTitle(kind, cwd));
+    (restricted
+      ? `${defaultSessionTitle(kind, cwd)} ·受限`
+      : resumeMode
+        ? `${defaultSessionTitle(kind, cwd)} · 续聊`
+        : defaultSessionTitle(kind, cwd));
 
   const pane = document.createElement("div");
   pane.className = "term-pane";
@@ -2126,8 +2272,10 @@ async function newSession(kind, options = {}) {
   tab.innerHTML = `
     <span class="tab-dot"></span>
     <span class="tab-title"></span>
+    <span class="tab-badge" hidden title="已完成 · 未查看"></span>
     <span class="tab-close" title="关闭">×</span>`;
   const titleEl = tab.querySelector(".tab-title");
+  const badgeEl = tab.querySelector(".tab-badge");
   tabsEl.appendChild(tab);
 
   const term = new Terminal({
@@ -2207,6 +2355,11 @@ async function newSession(kind, options = {}) {
     displayTitle: defaultName,
     /** @type {'last'|'picker'|null} 下次启动是否用 CLI resume */
     resumeMode,
+    /** @type {string|null} 绑定的 CLI 会话 ID（选会话/恢复后精确续接） */
+    cliSessionId,
+    restricted,
+    unreadDone: false,
+    badgeEl,
     launchCommand: launchCommand || null,
     exited: false,
     activityState: SESSION_ACTIVITY.idle,
@@ -2248,18 +2401,27 @@ async function newSession(kind, options = {}) {
     closeSession(id);
   });
 
-  session.unlistenOutput = await listen(`pty://output/${id}`, (event) => {
-    const payload = event.payload;
-    let byteLength = 0;
-    if (payload instanceof Array) {
-      byteLength = payload.length;
-      term.write(new Uint8Array(payload));
-    } else if (typeof payload === "string") {
-      byteLength = payload.length;
-      term.write(payload);
-    }
-    markSessionOutput(session, byteLength);
-  });
+  // PTY 输出走 Channel 二进制直通（后端 Response::new(Vec<u8>) → 前端 ArrayBuffer），
+  // 替代 pty://output 事件的 JSON 数组序列化，高输出场景吞吐大幅提升
+  const outputChannel = new Channel();
+  outputChannel.onmessage = (chunk) => {
+    const bytes =
+      chunk instanceof ArrayBuffer
+        ? new Uint8Array(chunk)
+        : Array.isArray(chunk)
+          ? new Uint8Array(chunk)
+          : null;
+    if (!bytes) return;
+    // 写入前记录视口是否处于底部；输出过快时 xterm 内部的自动跟随可能跟不上，
+    // 写入完成回调（真正渲染落盘后）里如果之前在底部就强制贴底，避免卡在中间需手动点按钮。
+    const buffer = term.buffer.active;
+    const wasAtBottom = buffer.viewportY >= buffer.baseY;
+    term.write(bytes, () => {
+      if (wasAtBottom) term.scrollToBottom();
+    });
+    markSessionOutput(session, bytes.byteLength);
+  };
+  session.outputChannel = outputChannel;
   session.unlistenExit = await listen(`pty://exit/${id}`, () => {
     session.exited = true;
     tab.classList.add("exited");
@@ -2267,7 +2429,9 @@ async function newSession(kind, options = {}) {
     applySessionActivityState(session, SESSION_ACTIVITY.idle);
     term.write("\r\n\x1b[90m[进程已退出 · 右键/⌘⇧R 重启 · 或命令面板重启]\x1b[0m\r\n");
     updateStatusBar();
-    notifySessionExited(session);
+    if (!session.closingManually) {
+      notifySessionExited(session);
+    }
   });
 
   updateEmptyHint();
@@ -2277,6 +2441,8 @@ async function newSession(kind, options = {}) {
   invoke("update_prefs", { patch: { lastKind: kind } }).catch(() => {});
 
   requestAnimationFrame(async () => {
+    // rAF 前标签可能已被关闭：此时不再创建 PTY，避免后端孤儿进程
+    if (!sessions.has(id)) return;
     fit(session);
     const { cols, rows } = term;
     try {
@@ -2287,7 +2453,13 @@ async function newSession(kind, options = {}) {
         rows,
         cwd: cwd || null,
         launchCommand: launchCommand || null,
+        onOutput: outputChannel,
       });
+      // 创建期间被关闭：后端已 spawn，需补杀避免泄漏
+      if (!sessions.has(id)) {
+        invoke("close_session", { id }).catch(() => {});
+        return;
+      }
       if (resumeMode) {
         term.write(
           `\x1b[90m[续聊] 已注入：${launchCommand}（历史由 CLI 加载，非终端滚动缓冲）\x1b[0m\r\n`
@@ -2326,7 +2498,16 @@ async function restartSession(session) {
   const wasSplitPartner = splitId === session.id;
   const wasActive = activeId === session.id;
   await closeSession(session.id, { force: true });
-  await newSession(kind, { cwd, title, resumeMode });
+  // 透传原 launchCommand：选会话续聊过的会话重启后仍接回同一 CLI 对话，
+  // 而不是退化到 --last 语义接到别的会话上
+  await newSession(kind, {
+    cwd,
+    title,
+    resumeMode,
+    launchCommand: session.launchCommand || undefined,
+    cliSessionId: session.cliSessionId || undefined,
+    restricted: session.restricted,
+  });
   if (wasSplitPartner || wasActive) {
     /* newSession 会 activate 新会话 */
   }
@@ -2545,6 +2726,8 @@ function fillLaunchForm() {
     launch.claude || "claude --permission-mode bypassPermissions --tools default";
   document.getElementById("launch-mimo").value =
     launch.mimo || "mimo --trust --never-ask";
+  document.getElementById("launch-grok").value =
+    launch.grok || "grok --always-approve --permission-mode bypassPermissions";
 }
 
 document.getElementById("save-launch-btn").addEventListener("click", async () => {
@@ -2559,6 +2742,9 @@ document.getElementById("save-launch-btn").addEventListener("click", async () =>
           codex: document.getElementById("launch-codex").value.trim() || "codex",
           claude: document.getElementById("launch-claude").value.trim() || "claude",
           mimo: document.getElementById("launch-mimo").value.trim() || "mimo",
+          grok:
+            document.getElementById("launch-grok").value.trim() ||
+            "grok --always-approve --permission-mode bypassPermissions",
         },
       },
     });
@@ -2757,11 +2943,26 @@ function buildPaletteCommands() {
     { id: "resume-claude-pick", label: "续聊 Claude（选择会话）", keys: "", run: () => resumePickerSession("claude") },
     { id: "resume-mimo-last", label: "续聊 MiMo（最近）", keys: "", run: () => resumeLastSession("mimo") },
     { id: "resume-mimo-pick", label: "续聊 MiMo（选择会话）", keys: "", run: () => resumePickerSession("mimo") },
+    { id: "resume-grok-last", label: "续聊 Grok（最近）", keys: "", run: () => resumeLastSession("grok") },
+    { id: "resume-grok-pick", label: "续聊 Grok（选择会话）", keys: "", run: () => resumePickerSession("grok") },
     { id: "new-codex", label: "新建 Codex", keys: "", run: () => newSession("codex") },
     { id: "new-claude", label: "新建 Claude", keys: "", run: () => newSession("claude") },
     { id: "new-kiro", label: "新建 Kiro", keys: "⌘⇧K", run: () => newSession("kiro") },
     { id: "new-mimo", label: "新建 MiMo", keys: "", run: () => newSession("mimo") },
+    { id: "new-grok", label: "新建 Grok", keys: "", run: () => newSession("grok") },
     { id: "new-shell", label: "新建 Shell", keys: "", run: () => newSession("shell") },
+    {
+      id: "new-restricted",
+      label: "新建受限会话（上次工具 · 无 bypass）",
+      keys: "",
+      run: () => newSession(lastKind || "codex", { restricted: true }),
+    },
+    {
+      id: "next-done",
+      label: "跳到下一个已完成（未读）会话",
+      keys: "⌘⇧N",
+      run: () => jumpToNextDone(),
+    },
     { id: "close", label: "关闭当前会话", keys: "⌘W", run: () => activeId && closeSession(activeId) },
     {
       id: "close-others",
@@ -2828,7 +3029,12 @@ function renderPalette(filter = "") {
   paletteCommands.forEach((command, index) => {
     const item = document.createElement("div");
     item.className = "palette-item" + (index === 0 ? " active" : "");
-    item.innerHTML = `<span>${command.label}</span><span class="pk">${command.keys || ""}</span>`;
+    const labelEl = document.createElement("span");
+    labelEl.textContent = command.label;
+    const keysEl = document.createElement("span");
+    keysEl.className = "pk";
+    keysEl.textContent = command.keys || "";
+    item.append(labelEl, keysEl);
     item.addEventListener("mouseenter", () => {
       paletteIndex = index;
       highlightPalette();
@@ -2919,6 +3125,20 @@ function switchTabByIndex(index) {
   if (id) activate(id);
 }
 
+/** 跳到下一个「已完成未读」会话（⌘⇧N）：多 Agent 并行时快速消费完成项 */
+function jumpToNextDone() {
+  if (!tabOrder.length) return;
+  const startIdx = Math.max(0, tabOrder.indexOf(activeId));
+  for (let i = 1; i <= tabOrder.length; i++) {
+    const id = tabOrder[(startIdx + i) % tabOrder.length];
+    const session = sessions.get(id);
+    if (session && session.unreadDone) {
+      activate(id);
+      return;
+    }
+  }
+}
+
 window.addEventListener("keydown", (event) => {
   // 模态内 Esc
   if (event.key === "Escape") {
@@ -2948,6 +3168,46 @@ window.addEventListener("keydown", (event) => {
     }
   }
 
+  // 焦点不在终端 textarea 时：拉回焦点；当前这次按键不会进 xterm，需补写
+  if (
+    !modKey(event) &&
+    !event.altKey &&
+    activeId &&
+    !isEditableTarget(event.target) &&
+    !event.isComposing
+  ) {
+    const modalOpen =
+      (settingsModal && !settingsModal.hidden) ||
+      (commandPalette && !commandPalette.hidden) ||
+      (confirmModal && !confirmModal.hidden) ||
+      (resumeModal && !resumeModal.hidden) ||
+      (searchBar && !searchBar.hidden);
+    if (!modalOpen) {
+      const session = sessions.get(activeId);
+      const textarea = session?.term?.textarea;
+      if (session && textarea && document.activeElement !== textarea) {
+        ensureTerminalFocus(session);
+        if (!session.exited) {
+          const key = event.key || "";
+          let ch = null;
+          if (key === "Enter") ch = "\r";
+          else if (key === "Backspace") ch = "\x7f";
+          else if (key === "Tab") ch = "\t";
+          else if (key === "Escape") ch = "\x1b";
+          else if (key.length === 1 && /[\x20-\x7e]/.test(key)) ch = key;
+          else if (shouldForceImePunctuation(event)) {
+            ch = resolveImePunctuationCharacter(event);
+          }
+          if (ch) {
+            writeForcedSessionCharacter(session, ch, event);
+            event.preventDefault();
+            return;
+          }
+        }
+      }
+    }
+  }
+
   if (!modKey(event)) return;
   const key = event.key.toLowerCase();
   const allowedInInput = new Set([
@@ -2959,6 +3219,7 @@ window.addEventListener("keydown", (event) => {
     "p",
     "r",
     "f",
+    "n",
     "1",
     "2",
     "3",
@@ -2997,6 +3258,11 @@ window.addEventListener("keydown", (event) => {
   if (key === "r" && event.shiftKey) {
     event.preventDefault();
     if (activeId) restartSession(sessions.get(activeId));
+    return;
+  }
+  if (key === "n" && event.shiftKey) {
+    event.preventDefault();
+    jumpToNextDone();
     return;
   }
   if (key === "p" && !event.shiftKey) {
@@ -3178,7 +3444,10 @@ if (dirFilterInput) {
 }
 
 document.querySelectorAll(".new-btn[data-kind]").forEach((btn) => {
-  btn.addEventListener("click", () => newSession(btn.dataset.kind));
+  btn.addEventListener("click", (event) => {
+    // ⌥(Alt)+点击 = 受限模式：不带 bypass/trust 高权限参数
+    newSession(btn.dataset.kind, { restricted: event.altKey });
+  });
 });
 document.querySelectorAll(".empty-card").forEach((btn) => {
   btn.addEventListener("click", () => newSession(btn.dataset.kind));
@@ -3267,6 +3536,8 @@ async function init() {
           cwd: snapshot.cwd || null,
           title: snapshot.title || "",
           resumeMode,
+          cliSessionId: snapshot.cliSessionId || null,
+          restricted: snapshot.restricted === true,
         });
       }
     }

@@ -44,6 +44,7 @@
   --codex: #00f0ff;
   --claude: #ff6b2b;
   --mimo: #00ff9c;
+  --grok: #a78bfa;
   --shell: #9aa7b2;
   --accent: var(--color-accent);
 
@@ -116,6 +117,7 @@ html[data-theme="matrix"] {
   --codex: #0aff9d;
   --claude: #c8ff4a;
   --mimo: #00ff66;
+  --grok: #b794f6;
   --shell: #8aa892;
   --shadow-sm: 0 0 0 1px rgba(0, 255, 102, 0.1);
   --shadow-md: 0 0 24px rgba(0, 255, 102, 0.14), 0 8px 28px rgba(0, 0, 0, 0.55);
@@ -170,6 +172,7 @@ html[data-theme="arctic"] {
   --codex: #4cc9ff;
   --claude: #66b3ff;
   --mimo: #3dffb5;
+  --grok: #b48cff;
   --shell: #8ea3b5;
   --shadow-sm: 0 0 0 1px rgba(76, 201, 255, 0.1);
   --shadow-md: 0 0 24px rgba(76, 201, 255, 0.14), 0 8px 28px rgba(0, 0, 0, 0.55);
@@ -224,6 +227,7 @@ html[data-theme="plasma"] {
   --codex: #c77dff;
   --claude: #ff7ad9;
   --mimo: #7dffb2;
+  --grok: #9b5cff;
   --shell: #a898b8;
   --shadow-sm: 0 0 0 1px rgba(199, 125, 255, 0.12);
   --shadow-md: 0 0 24px rgba(199, 125, 255, 0.16), 0 8px 28px rgba(0, 0, 0, 0.55);
@@ -278,6 +282,7 @@ html[data-theme="amber"] {
   --codex: #ffd166;
   --claude: #ff6b2b;
   --mimo: #ffb000;
+  --grok: #e0aaff;
   --shell: #a89880;
   --shadow-sm: 0 0 0 1px rgba(255, 176, 0, 0.1);
   --shadow-md: 0 0 24px rgba(255, 176, 0, 0.14), 0 8px 28px rgba(0, 0, 0, 0.55);
@@ -332,6 +337,7 @@ html[data-theme="holographic"] {
   --codex: #00bbf9;
   --claude: #9b5de5;
   --mimo: #00f5d4;
+  --grok: #c77dff;
   --shell: #9aa7b8;
   --shadow-sm: 0 0 0 1px rgba(0, 245, 212, 0.1);
   --shadow-md: 0 0 24px rgba(0, 245, 212, 0.12), 0 8px 28px rgba(0, 0, 0, 0.55);
@@ -1099,6 +1105,7 @@ body::after {
 .tab.active.kind-codex::after { background: var(--codex); box-shadow: 0 0 10px var(--codex); }
 .tab.active.kind-claude::after { background: var(--claude); box-shadow: 0 0 10px var(--claude); }
 .tab.active.kind-mimo::after { background: var(--mimo); box-shadow: 0 0 10px var(--mimo); }
+.tab.active.kind-grok::after { background: var(--grok); box-shadow: 0 0 10px var(--grok); }
 .tab.active.kind-shell::after { background: var(--shell); box-shadow: 0 0 10px var(--shell); }
 
 .tab .tab-dot {
@@ -1112,6 +1119,7 @@ body::after {
 .tab.kind-codex .tab-dot { background: var(--codex); color: var(--codex); }
 .tab.kind-claude .tab-dot { background: var(--claude); color: var(--claude); }
 .tab.kind-mimo .tab-dot { background: var(--mimo); color: var(--mimo); }
+.tab.kind-grok .tab-dot { background: var(--grok); color: var(--grok); }
 .tab.kind-shell .tab-dot { background: var(--shell); color: var(--shell); }
 
 .tab .tab-title {
@@ -1133,6 +1141,16 @@ body::after {
   padding: 0 6px;
   outline: none;
   user-select: text;
+}
+
+/* 「已完成未读」角标：进入 done 且未查看时显示的绿色小点 */
+.tab .tab-badge {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #00ff9c;
+  box-shadow: 0 0 8px rgba(0, 255, 156, 0.85);
 }
 
 .tab .tab-close {
@@ -1250,11 +1268,13 @@ body::after {
 .new-btn.codex .dot { background: var(--codex); color: var(--codex); }
 .new-btn.claude .dot { background: var(--claude); color: var(--claude); }
 .new-btn.mimo .dot { background: var(--mimo); color: var(--mimo); }
+.new-btn.grok .dot { background: var(--grok); color: var(--grok); }
 .new-btn.shell .dot { background: var(--shell); color: var(--shell); }
 .new-btn.kiro:hover { border-color: rgba(255, 43, 214, 0.55); box-shadow: 0 0 16px rgba(255, 43, 214, 0.18); }
 .new-btn.codex:hover { border-color: rgba(0, 240, 255, 0.55); box-shadow: 0 0 16px rgba(0, 240, 255, 0.18); }
 .new-btn.claude:hover { border-color: rgba(255, 107, 43, 0.55); box-shadow: 0 0 16px rgba(255, 107, 43, 0.18); }
 .new-btn.mimo:hover { border-color: rgba(0, 255, 156, 0.55); box-shadow: 0 0 16px rgba(0, 255, 156, 0.18); }
+.new-btn.grok:hover { border-color: rgba(167, 139, 250, 0.55); box-shadow: 0 0 16px rgba(167, 139, 250, 0.18); }
 .new-btn.shell:hover { border-color: rgba(0, 240, 255, 0.35); }
 
 #cmd-palette-btn {
@@ -1550,11 +1570,13 @@ body::after {
 .empty-card.codex .dot { background: var(--codex); color: var(--codex); }
 .empty-card.claude .dot { background: var(--claude); color: var(--claude); }
 .empty-card.mimo .dot { background: var(--mimo); color: var(--mimo); }
+.empty-card.grok .dot { background: var(--grok); color: var(--grok); }
 .empty-card.shell .dot { background: var(--shell); color: var(--shell); }
 .empty-card.kiro:hover { border-color: rgba(255, 43, 214, 0.5); box-shadow: 0 8px 24px rgba(255, 43, 214, 0.18); }
 .empty-card.codex:hover { border-color: rgba(0, 240, 255, 0.5); box-shadow: 0 8px 24px rgba(0, 240, 255, 0.18); }
 .empty-card.claude:hover { border-color: rgba(255, 107, 43, 0.5); box-shadow: 0 8px 24px rgba(255, 107, 43, 0.18); }
 .empty-card.mimo:hover { border-color: rgba(0, 255, 156, 0.5); box-shadow: 0 8px 24px rgba(0, 255, 156, 0.18); }
+.empty-card.grok:hover { border-color: rgba(167, 139, 250, 0.5); box-shadow: 0 8px 24px rgba(167, 139, 250, 0.18); }
 .empty-keys {
   font-size: 11px !important;
   font-family: var(--font-mono);
