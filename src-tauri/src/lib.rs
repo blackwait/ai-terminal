@@ -9,7 +9,6 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 /// 单个 PTY 会话持有的资源
@@ -677,31 +676,10 @@ async fn check_cli(state: State<'_, AppState>, kind: String) -> Result<CliCheckR
 #[tauri::command]
 async fn check_all_cli(state: State<'_, AppState>) -> Result<Vec<CliCheckResult>, String> {
     let cfg = state.config.lock().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        // 5 个 CLI 检测并行：每个都是 spawn 子进程，串行等待是白耗
-        let kinds = ["kiro", "codex", "claude", "mimo", "grok"];
-        let cfg_ref = &cfg;
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = kinds
-                .iter()
-                .map(|kind| scope.spawn(move || check_cli_with_config(cfg_ref, kind)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| CliCheckResult {
-                        kind: "unknown".into(),
-                        command: String::new(),
-                        available: false,
-                        path: None,
-                        message: "内部错误".into(),
-                    })
-                })
-                .collect()
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())
+    ["kiro", "codex", "claude", "mimo", "grok"]
+        .iter()
+        .map(|kind| check_cli_with_config(&cfg, kind))
+        .collect()
 }
 
 // ---------- AI 历史会话列表（应用内续聊选择）----------
@@ -1151,16 +1129,15 @@ fn list_grok_history_sessions(filter_cwd: Option<&str>, limit: usize) -> Vec<AiH
             }
         }
     }
-    // 同上：先取 mtime 再排序
-    let mut with_mtime: Vec<(PathBuf, Option<std::time::SystemTime>)> = summaries
-        .into_iter()
-        .map(|p| {
-            let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
-            (p, t)
-        })
-        .collect();
-    with_mtime.sort_by(|a, b| b.1.cmp(&a.1));
-    let summaries: Vec<PathBuf> = with_mtime.into_iter().map(|(p, _)| p).collect();
+    summaries.sort_by(|left, right| {
+        let left_time = std::fs::metadata(left)
+            .and_then(|m| m.modified())
+            .ok();
+        let right_time = std::fs::metadata(right)
+            .and_then(|m| m.modified())
+            .ok();
+        right_time.cmp(&left_time)
+    });
     let mut results = Vec::new();
     for path in summaries {
         if results.len() >= limit {
@@ -1336,22 +1313,17 @@ async fn list_ai_sessions(
     cwd: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<AiHistorySession>, String> {
-    // 同步命令会跑在主线程：文件扫描 + 子进程（最长 5s）必须移出
-    tauri::async_runtime::spawn_blocking(move || {
-        let max_items = limit.unwrap_or(40).clamp(1, 100) as usize;
-        let filter = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let list = match kind.as_str() {
-            "codex" => list_codex_history_sessions(filter, max_items),
-            "kiro" => list_kiro_history_sessions(filter, max_items),
-            "mimo" => list_mimo_history_sessions(filter, max_items),
-            "claude" => list_claude_history_sessions(filter, max_items),
-            "grok" => list_grok_history_sessions(filter, max_items),
-            _ => return Err(format!("不支持列出历史会话的工具: {kind}")),
-        };
-        Ok(list)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let max_items = limit.unwrap_or(40).clamp(1, 100) as usize;
+    let filter = cwd.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let list = match kind.as_str() {
+        "codex" => list_codex_history_sessions(filter, max_items),
+        "kiro" => list_kiro_history_sessions(filter, max_items),
+        "mimo" => list_mimo_history_sessions(filter, max_items),
+        "claude" => list_claude_history_sessions(filter, max_items),
+        "grok" => list_grok_history_sessions(filter, max_items),
+        _ => return Err(format!("不支持列出历史会话的工具: {kind}")),
+    };
+    Ok(list)
 }
 
 // ---------- 会话 ----------
@@ -1387,16 +1359,43 @@ async fn create_session(
         // 续聊会传 launch_command：即使关闭「自动启动 AI」也要注入 resume 命令
         let should_auto_inject = cfg_snapshot.auto_launch || launch_override.is_some();
 
-        // 若需要自动注入 AI / 续聊命令，先检查 CLI 是否存在
-        if should_auto_inject && kind != "shell" {
-            let binary = if let Some(ref override_line) = launch_override {
-                override_line
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                cli_binary_for_kind(&kind, &cfg_snapshot.launch_args)
+    // 延迟注入 AI CLI / 续聊命令，等待 login shell 就绪
+    if should_auto_inject {
+        let launch_line = if let Some(override_line) = launch_override {
+            Some(override_line)
+        } else {
+            match kind.as_str() {
+                "kiro" => Some(cfg_snapshot.launch_args.kiro.clone()),
+                "codex" => Some(cfg_snapshot.launch_args.codex.clone()),
+                "claude" => Some(cfg_snapshot.launch_args.claude.clone()),
+                "mimo" => Some(cfg_snapshot.launch_args.mimo.clone()),
+                "grok" => Some(cfg_snapshot.launch_args.grok.clone()),
+                "shell" => None,
+                _ => None,
+            }
+        };
+        if let Some(line) = launch_line {
+            let delay = cfg_snapshot.launch_delay_ms;
+            let sessions = Arc::clone(&state.sessions);
+            let sid = id.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(delay));
+                if let Some(sess) = sessions.lock().get_mut(&sid) {
+                    let payload = format!("{}\r", line.trim());
+                    let _ = sess.writer.write_all(payload.as_bytes());
+                    let _ = sess.writer.flush();
+                }
+            });
+        }
+    }
+
+    // 使用过的目录记入最近
+    if let Some(dir) = work_dir {
+        if Path::new(&dir).is_dir() {
+            let snapshot = {
+                let mut cfg = state.config.lock();
+                push_recent(&mut cfg, &dir);
+                cfg.clone()
             };
             if !binary.is_empty() && which_command(&binary).is_none() {
                 return Err(format!(
@@ -1750,51 +1749,90 @@ fn read_ai_config_blocking(tool: &str) -> Result<AiToolConfig, String> {
             // 以及 [model.<id>] 段内的 base_url / api_key
             let config_path = format!("{}/.grok/config.toml", home);
             let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
-            let doc = config_text.parse::<toml_edit::DocumentMut>().ok();
-            let model = doc
-                .as_ref()
-                .and_then(|d| d.get("models"))
-                .and_then(|t| t.get("default"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let mut base_url = doc
-                .as_ref()
-                .and_then(|d| d.get("endpoints"))
-                .and_then(|t| t.get("models_base_url"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
+            let mut model = String::new();
+            let mut base_url = String::new();
             let mut api_key = String::new();
-            // [model.<id>] 段：优先 default 模型对应 section，否则取第一个含该 key 的
-            if let Some(model_tbl) = doc
-                .as_ref()
-                .and_then(|d| d.get("model"))
-                .and_then(|t| t.as_table_like())
-            {
-                // 模型 id 可能含点号（如 grok-4.5），TOML 会解析成多级嵌套，需递归收集
-                let mut sections: Vec<(String, &dyn toml_edit::TableLike)> = Vec::new();
-                collect_model_sections(model_tbl, "", &mut sections);
-                let pick = |key: &str| -> Option<String> {
-                    let mut fallback: Option<String> = None;
-                    for (name, sub) in &sections {
-                        if let Some(v) = sub.get(key).and_then(|v| v.as_str()) {
-                            if !model.is_empty() && name == &model {
-                                return Some(v.to_string());
-                            }
-                            if fallback.is_none() {
-                                fallback = Some(v.to_string());
+            let mut current_section = String::new();
+            let mut model_section_api_key = String::new();
+            let mut model_section_base_url = String::new();
+            for line in config_text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    current_section = trimmed[1..trimmed.len() - 1].to_string();
+                    continue;
+                }
+                if let Some((raw_key, raw_val)) = trimmed.split_once('=') {
+                    let key = raw_key.trim();
+                    let val = raw_val
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+                    match current_section.as_str() {
+                        "models" if key == "default" => model = val,
+                        "endpoints" if key == "models_base_url" => {
+                            if base_url.is_empty() {
+                                base_url = val;
                             }
                         }
+                        s if s.starts_with("model.") => {
+                            if key == "api_key" && model_section_api_key.is_empty() {
+                                model_section_api_key = val;
+                            } else if key == "base_url" && model_section_base_url.is_empty() {
+                                model_section_base_url = val;
+                            } else if key == "api_key" {
+                                // 优先匹配当前 default 模型对应的 section
+                                let section_model = s.strip_prefix("model.").unwrap_or("");
+                                if !model.is_empty() && section_model == model {
+                                    model_section_api_key = val;
+                                }
+                            } else if key == "base_url" {
+                                let section_model = s.strip_prefix("model.").unwrap_or("");
+                                if !model.is_empty() && section_model == model {
+                                    model_section_base_url = val;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    fallback
-                };
-                if let Some(v) = pick("base_url") {
-                    base_url = v;
                 }
-                if let Some(v) = pick("api_key") {
-                    api_key = v;
+            }
+            // 再扫一遍，确保 default 模型 section 的 key 覆盖兜底值
+            if !model.is_empty() {
+                current_section.clear();
+                let target = format!("model.{}", model);
+                for line in config_text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                        current_section = trimmed[1..trimmed.len() - 1].to_string();
+                        continue;
+                    }
+                    if current_section != target {
+                        continue;
+                    }
+                    if let Some((raw_key, raw_val)) = trimmed.split_once('=') {
+                        let key = raw_key.trim();
+                        let val = raw_val
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string();
+                        if key == "api_key" {
+                            model_section_api_key = val;
+                        } else if key == "base_url" {
+                            model_section_base_url = val;
+                        }
+                    }
                 }
+            }
+            if !model_section_base_url.is_empty() {
+                base_url = model_section_base_url;
+            }
+            if !model_section_api_key.is_empty() {
+                api_key = model_section_api_key;
             }
             Ok(AiToolConfig {
                 base_url,
@@ -1937,42 +1975,53 @@ fn write_ai_config_blocking(tool: &str, config: &AiToolConfig) -> Result<(), Str
             let config_path = format!("{}/.grok/config.toml", home);
             let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
             if !config.model.is_empty() {
-                content = toml_set_key(&content, Some("models"), "default", &config.model)?;
+                content =
+                    update_toml_section_value(&content, "models", "default", &config.model);
             }
             if !config.base_url.is_empty() {
-                content = toml_set_key(
+                content = update_toml_section_value(
                     &content,
-                    Some("endpoints"),
+                    "endpoints",
                     "models_base_url",
                     &config.base_url,
-                )?;
+                );
             }
             // 写入 / 更新 [model.<id>] 段，保证该模型有 base_url / api_key
             let model_id = if config.model.is_empty() {
                 // 从现有配置读 default
-                content
-                    .parse::<toml_edit::DocumentMut>()
-                    .ok()
-                    .and_then(|d| {
-                        d.get("models")
-                            .and_then(|t| t.get("default"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "grok-4.5".into())
+                let mut default_model = String::new();
+                let mut in_models = false;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with('[') {
+                        in_models = trimmed == "[models]";
+                        continue;
+                    }
+                    if in_models {
+                        if let Some(v) = trimmed.strip_prefix("default = ") {
+                            default_model = v.trim_matches('"').trim_matches('\'').to_string();
+                            break;
+                        }
+                    }
+                }
+                if default_model.is_empty() {
+                    "grok-4.5".into()
+                } else {
+                    default_model
+                }
             } else {
                 config.model.clone()
             };
             let section = format!("model.{}", model_id);
             if !config.base_url.is_empty() {
                 content =
-                    toml_set_key(&content, Some(&section), "base_url", &config.base_url)?;
+                    update_toml_section_value(&content, &section, "base_url", &config.base_url);
                 // 同步 model 字段，便于 CLI 识别
-                content = toml_set_key(&content, Some(&section), "model", &model_id)?;
+                content = update_toml_section_value(&content, &section, "model", &model_id);
             }
             if !config.api_key.is_empty() {
-                content = toml_set_key(&content, Some(&section), "api_key", &config.api_key)?;
+                content =
+                    update_toml_section_value(&content, &section, "api_key", &config.api_key);
             }
             if let Some(parent) = Path::new(&config_path).parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

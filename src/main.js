@@ -1461,21 +1461,13 @@ function shouldForceImePunctuation(event) {
 
 function writeForcedSessionCharacter(session, character, sourceEvent = null) {
   if (!session || session.exited || !character) return false;
-  // 同一 keydown 事件可能同时命中 customKeyHandler 与 capture：按事件对象去重，
-  // 不用同字符时间窗（快速连按同一标点如 "??" 会被误吞）
-  if (sourceEvent) {
-    if (session._lastForcedEvent === sourceEvent) return false;
-    session._lastForcedEvent = sourceEvent;
-  } else {
-    const now = Date.now();
-    if (
-      session._lastForcedChar === character &&
-      now - (session._lastForcedAt || 0) < 40
-    ) {
-      return false;
-    }
-    session._lastForcedChar = character;
-    session._lastForcedAt = now;
+  const now = Date.now();
+  // 同一按键可能同时命中 customKeyHandler 与 capture，短窗口去重
+  if (
+    session._lastForcedChar === character &&
+    now - (session._lastForcedAt || 0) < 40
+  ) {
+    return false;
   }
   const textarea = session.term?.textarea;
   try {
@@ -2401,27 +2393,26 @@ async function newSession(kind, options = {}) {
     closeSession(id);
   });
 
-  // PTY 输出走 Channel 二进制直通（后端 Response::new(Vec<u8>) → 前端 ArrayBuffer），
-  // 替代 pty://output 事件的 JSON 数组序列化，高输出场景吞吐大幅提升
-  const outputChannel = new Channel();
-  outputChannel.onmessage = (chunk) => {
-    const bytes =
-      chunk instanceof ArrayBuffer
-        ? new Uint8Array(chunk)
-        : Array.isArray(chunk)
-          ? new Uint8Array(chunk)
-          : null;
-    if (!bytes) return;
+  session.unlistenOutput = await listen(`pty://output/${id}`, (event) => {
+    const payload = event.payload;
+    let byteLength = 0;
     // 写入前记录视口是否处于底部；输出过快时 xterm 内部的自动跟随可能跟不上，
     // 写入完成回调（真正渲染落盘后）里如果之前在底部就强制贴底，避免卡在中间需手动点按钮。
     const buffer = term.buffer.active;
     const wasAtBottom = buffer.viewportY >= buffer.baseY;
-    term.write(bytes, () => {
-      if (wasAtBottom) term.scrollToBottom();
-    });
-    markSessionOutput(session, bytes.byteLength);
-  };
-  session.outputChannel = outputChannel;
+    if (payload instanceof Array) {
+      byteLength = payload.length;
+      term.write(new Uint8Array(payload), () => {
+        if (wasAtBottom) term.scrollToBottom();
+      });
+    } else if (typeof payload === "string") {
+      byteLength = payload.length;
+      term.write(payload, () => {
+        if (wasAtBottom) term.scrollToBottom();
+      });
+    }
+    markSessionOutput(session, byteLength);
+  });
   session.unlistenExit = await listen(`pty://exit/${id}`, () => {
     session.exited = true;
     tab.classList.add("exited");
@@ -3199,7 +3190,7 @@ window.addEventListener("keydown", (event) => {
             ch = resolveImePunctuationCharacter(event);
           }
           if (ch) {
-            writeForcedSessionCharacter(session, ch, event);
+            writeForcedSessionCharacter(session, ch);
             event.preventDefault();
             return;
           }
